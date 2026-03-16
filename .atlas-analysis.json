@@ -1,0 +1,130 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "HTTPower",
+  "projectDescription": "A production-ready Elixir HTTP client library with built-in reliability patterns including circuit breaker, rate limiting, PCI-compliant logging, and smart retries across Finch, Req, and Tesla adapters.",
+  "theme": "sequoia",
+  "primaryColor": "#94cb04",
+  "lightColor": "#545454",
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "adapters"
+            ]
+          },
+          {
+            "group": "Core Features",
+            "pages": [
+              "features/circuit-breaker",
+              "features/rate-limiting",
+              "features/retries",
+              "features/deduplication",
+              "features/pci-logging",
+              "features/telemetry"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/overview",
+              "configuration/profiles",
+              "configuration/test-mode"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/production-deployment",
+              "guides/observability",
+              "guides/migrating-from-tesla",
+              "guides/migrating-from-req"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core",
+            "pages": [
+              "api/httpower",
+              "api/client",
+              "api/response",
+              "api/error"
+            ]
+          },
+          {
+            "group": "Middleware",
+            "pages": [
+              "api/middleware/circuit-breaker",
+              "api/middleware/rate-limiter",
+              "api/middleware/dedup"
+            ]
+          },
+          {
+            "group": "Adapters",
+            "pages": [
+              "api/adapters/finch",
+              "api/adapters/req",
+              "api/adapters/tesla"
+            ]
+          },
+          {
+            "group": "Utilities",
+            "pages": [
+              "api/logger",
+              "api/profiles",
+              "api/rate-limit-headers",
+              "api/test"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Circuit breaker with closed/open/half-open states and configurable thresholds",
+    "Token bucket rate limiting with per-endpoint configuration and adaptive behavior",
+    "PCI-compliant logging with automatic sanitization of sensitive data",
+    "Smart retry logic with exponential backoff, jitter, and Retry-After header support",
+    "Request deduplication to prevent duplicate side effects from double-clicks or race conditions",
+    "Comprehensive telemetry events via Elixir's :telemetry library",
+    "Multi-adapter support: Finch (default), Req, and Tesla",
+    "Pre-configured profiles for payment processing, high-volume APIs, and microservices",
+    "Test mode with adapter-agnostic mocking via HTTPower.Test",
+    "Clean error handling — never raises exceptions, always returns result tuples"
+  ],
+  "publicApiSurface": [
+    "HTTPower.new/1",
+    "HTTPower.get/2,3",
+    "HTTPower.post/2,3",
+    "HTTPower.put/2,3",
+    "HTTPower.delete/2,3",
+    "HTTPower.patch/2,3",
+    "HTTPower.head/2,3",
+    "HTTPower.options/2,3",
+    "HTTPower.test_mode?/0",
+    "HTTPower.Logger.attach/0,1",
+    "HTTPower.Logger.detach/0",
+    "HTTPower.Middleware.CircuitBreaker.get_state/1",
+    "HTTPower.Middleware.CircuitBreaker.open_circuit/1",
+    "HTTPower.Middleware.CircuitBreaker.close_circuit/1",
+    "HTTPower.Middleware.CircuitBreaker.reset_circuit/1",
+    "HTTPower.Middleware.RateLimiter.update_from_headers/2",
+    "HTTPower.Middleware.RateLimiter.get_info/1",
+    "HTTPower.RateLimitHeaders.parse/1",
+    "HTTPower.Profiles.get/1",
+    "HTTPower.Profiles.list/0",
+    "HTTPower.Test.setup/0",
+    "HTTPower.Test.stub/1",
+    "HTTPower.Test.json/2"
+  ]
+}
