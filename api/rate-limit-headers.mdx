@@ -1,0 +1,195 @@
+---
+title: "HTTPower.RateLimitHeaders"
+description: "Parse rate limit headers from HTTP responses across GitHub, RFC 6585, Stripe, and Retry-After formats."
+---
+
+`HTTPower.RateLimitHeaders` parses rate limit metadata from HTTP response headers. It supports four header formats used by common APIs and returns a normalized result that can be fed directly into `HTTPower.Middleware.RateLimiter.update_from_headers/2`.
+
+---
+
+## Supported Header Formats
+
+<AccordionGroup>
+  <Accordion title="GitHub / Twitter style (`:github`)">
+    Used by GitHub API, Twitter/X API, and many others.
+
+    | Header | Description |
+    |--------|-------------|
+    | `X-RateLimit-Limit` | Maximum requests per window |
+    | `X-RateLimit-Remaining` | Requests remaining in current window |
+    | `X-RateLimit-Reset` | Unix timestamp (seconds) when the window resets |
+
+    ```
+    X-RateLimit-Limit: 60
+    X-RateLimit-Remaining: 55
+    X-RateLimit-Reset: 1234567890
+    ```
+  </Accordion>
+  <Accordion title="RFC 6585 / IETF style (`:rfc`)">
+    Standardized headers from the IETF RateLimit Headers specification.
+
+    | Header | Description |
+    |--------|-------------|
+    | `RateLimit-Limit` | Maximum requests per window |
+    | `RateLimit-Remaining` | Requests remaining in current window |
+    | `RateLimit-Reset` | Unix timestamp (seconds) when the window resets |
+
+    ```
+    RateLimit-Limit: 100
+    RateLimit-Remaining: 42
+    RateLimit-Reset: 1234567890
+    ```
+  </Accordion>
+  <Accordion title="Stripe style (`:stripe`)">
+    Used by Stripe's API.
+
+    | Header | Description |
+    |--------|-------------|
+    | `X-Stripe-RateLimit-Limit` | Maximum requests per window |
+    | `X-Stripe-RateLimit-Remaining` | Requests remaining in current window |
+    | `X-Stripe-RateLimit-Reset` | Unix timestamp (seconds) when the window resets |
+
+    ```
+    X-Stripe-RateLimit-Limit: 200
+    X-Stripe-RateLimit-Remaining: 198
+    X-Stripe-RateLimit-Reset: 1234567890
+    ```
+  </Accordion>
+  <Accordion title="Retry-After (`:retry_after`)">
+    Returned on 429 Too Many Requests and 503 Service Unavailable responses.
+
+    | Header | Description |
+    |--------|-------------|
+    | `Retry-After` | Either an integer (seconds to wait) or an RFC 7231 HTTP date string |
+
+    ```
+    # Integer seconds
+    Retry-After: 120
+
+    # HTTP date
+    Retry-After: Wed, 21 Oct 2015 07:28:00 GMT
+    ```
+  </Accordion>
+</AccordionGroup>
+
+Header matching is **case-insensitive**. Headers are normalized to lowercase before lookup.
+
+---
+
+## `parse/2`
+
+Parses rate limit headers from an HTTP response headers map.
+
+```elixir
+@spec parse(map(), keyword()) :: {:ok, rate_limit_info()} | {:error, :not_found}
+```
+
+<ParamField path="headers" type="map()" required>
+  The response headers map. Keys may be any case; they are normalized to lowercase internally.
+</ParamField>
+
+<ParamField path="opts" type="keyword()">
+  Options:
+  - `:format` — Which header format to look for. One of `:auto`, `:github`, `:rfc`, `:stripe`, `:retry_after`. Default: `:auto`.
+</ParamField>
+
+When `:format` is `:auto` (the default), formats are tried in order: `:github` → `:rfc` → `:stripe`. The first successful parse is returned.
+
+**Success return fields:**
+
+<ResponseField name="limit" type="pos_integer()">
+  The maximum number of requests allowed per window as reported by the server.
+</ResponseField>
+
+<ResponseField name="remaining" type="non_neg_integer()">
+  The number of requests remaining in the current window.
+</ResponseField>
+
+<ResponseField name="reset_at" type="DateTime.t()">
+  UTC `DateTime` when the rate limit window resets, derived from the Unix timestamp in the header.
+</ResponseField>
+
+<ResponseField name="format" type="atom()">
+  The header format that was successfully parsed: `:github`, `:rfc`, or `:stripe`.
+</ResponseField>
+
+```elixir
+# GitHub-style headers
+headers = %{
+  "x-ratelimit-limit" => "60",
+  "x-ratelimit-remaining" => "55",
+  "x-ratelimit-reset" => "1234567890"
+}
+
+HTTPower.RateLimitHeaders.parse(headers)
+# => {:ok, %{
+#      limit: 60,
+#      remaining: 55,
+#      reset_at: ~U[2009-02-13 23:31:30Z],
+#      format: :github
+#    }}
+
+# No rate limit headers present
+HTTPower.RateLimitHeaders.parse(%{"content-type" => "application/json"})
+# => {:error, :not_found}
+
+# Explicit format selection
+HTTPower.RateLimitHeaders.parse(headers, format: :github)
+```
+
+---
+
+## `parse_retry_after/1`
+
+Parses only the `Retry-After` header from a headers map. Returns the number of seconds to wait before retrying.
+
+```elixir
+@spec parse_retry_after(map()) :: {:ok, non_neg_integer()} | {:error, :not_found}
+```
+
+<ParamField path="headers" type="map()" required>
+  The response headers map. Normalized to lowercase internally.
+</ParamField>
+
+Accepts two `Retry-After` value formats:
+- **Integer seconds** — `"120"` → `{:ok, 120}`
+- **RFC 7231 HTTP date** — `"Wed, 21 Oct 2015 07:28:00 GMT"` → `{:ok, seconds_until_that_time}`
+
+```elixir
+# Integer seconds
+HTTPower.RateLimitHeaders.parse_retry_after(%{"retry-after" => "120"})
+# => {:ok, 120}
+
+# HTTP date string
+HTTPower.RateLimitHeaders.parse_retry_after(%{"retry-after" => "Wed, 21 Oct 2015 07:28:00 GMT"})
+# => {:ok, <seconds until that time>}
+
+# Not present
+HTTPower.RateLimitHeaders.parse_retry_after(%{})
+# => {:error, :not_found}
+```
+
+---
+
+## Integration with RateLimiter
+
+Use `parse/2` after each response to keep the local token bucket synchronized with the server's state:
+
+```elixir
+{:ok, response} = HTTPower.get("https://api.github.com/repos/elixir-lang/elixir")
+
+case HTTPower.RateLimitHeaders.parse(response.headers) do
+  {:ok, rate_limit_info} ->
+    HTTPower.Middleware.RateLimiter.update_from_headers(
+      "api.github.com",
+      rate_limit_info
+    )
+
+  {:error, :not_found} ->
+    :ok
+end
+
+# Verify the bucket was updated
+HTTPower.Middleware.RateLimiter.get_info("api.github.com")
+# => %{current_tokens: 55.0, last_refill_ms: ...}
+```

@@ -1,0 +1,217 @@
+---
+title: 'Test Mode'
+description: 'Block all real HTTP requests during testing and replace them with adapter-agnostic stubs using HTTPower.Test.'
+keywords: ['test mode', 'mocking', 'stubs', 'HTTPower.Test', 'testing']
+---
+
+Test mode blocks all real outbound HTTP requests. Any call that would reach the network returns `{:error, %HTTPower.Error{reason: :network_blocked}}` unless it goes through an `HTTPower.Test` stub. This prevents tests from making accidental network calls and ensures your test suite remains deterministic.
+
+<Note>
+Test mode is adapter-agnostic. `HTTPower.Test` works the same way regardless of whether your application uses `HTTPower.Adapter.Req`, `HTTPower.Adapter.Tesla`, or any other adapter. You never need to know which adapter is active in a test.
+</Note>
+
+## Setup
+
+<Steps>
+  <Step title="Enable test mode in config/test.exs">
+    Add the following to your test configuration file. This disables all middleware that would interfere with deterministic tests and enables test mode.
+
+    ```elixir
+    # config/test.exs
+    config :httpower,
+      test_mode: true,
+      logging: [enabled: false],
+      circuit_breaker: [enabled: false],
+      rate_limit: [enabled: false]
+    ```
+  </Step>
+  <Step title="Add plug to test dependencies">
+    `HTTPower.Test` uses `Plug.Test` to build `Plug.Conn` structs for stubs. Add `plug` as a test-only dependency in `mix.exs`:
+
+    ```elixir
+    defp deps do
+      [
+        {:httpower, "~> 0.19"},
+        {:plug, "~> 1.15", only: :test}
+      ]
+    end
+    ```
+  </Step>
+  <Step title="Call HTTPower.Test.setup/0 in your test setup">
+    Call `HTTPower.Test.setup/0` in each test's `setup` block. This registers the test process as an owner for stubs and cleans up automatically when the test finishes.
+
+    ```elixir
+    defmodule MyApp.ApiClientTest do
+      use ExUnit.Case
+
+      setup do
+        HTTPower.Test.setup()
+      end
+
+      # tests go here
+    end
+    ```
+  </Step>
+  <Step title="Register a stub with HTTPower.Test.stub/1">
+    Inside each test, call `HTTPower.Test.stub/1` with a function that accepts a `Plug.Conn` and returns one. Use `HTTPower.Test.json/2`, `HTTPower.Test.html/2`, or `HTTPower.Test.text/2` to build responses.
+
+    ```elixir
+    test "fetches users" do
+      HTTPower.Test.stub(fn conn ->
+        case {conn.method, conn.request_path} do
+          {"GET", "/users"} ->
+            HTTPower.Test.json(conn, %{users: ["alice", "bob"]})
+
+          {"POST", "/users"} ->
+            HTTPower.Test.json(conn, %{created: true}, status: 201)
+
+          _ ->
+            HTTPower.Test.json(conn, %{error: "not found"}, status: 404)
+        end
+      end)
+
+      {:ok, response} = HTTPower.get("https://api.example.com/users")
+
+      assert response.status == 200
+      assert response.body == %{"users" => ["alice", "bob"]}
+    end
+    ```
+  </Step>
+</Steps>
+
+## Response helpers
+
+### HTTPower.Test.json/2
+
+Sends a JSON response. The `data` argument is encoded with `Jason.encode!/1`.
+
+```elixir
+# 200 OK with JSON body
+HTTPower.Test.json(conn, %{status: "ok"})
+
+# Custom status code
+HTTPower.Test.json(conn, %{error: "not found"}, status: 404)
+HTTPower.Test.json(conn, %{created: true}, status: 201)
+```
+
+### HTTPower.Test.html/2
+
+Sends an HTML response.
+
+```elixir
+HTTPower.Test.html(conn, "<h1>Hello</h1>")
+HTTPower.Test.html(conn, "<h1>Not Found</h1>", status: 404)
+```
+
+### HTTPower.Test.text/2
+
+Sends a plain-text response.
+
+```elixir
+HTTPower.Test.text(conn, "Hello, World!")
+HTTPower.Test.text(conn, "Not Found", status: 404)
+```
+
+### HTTPower.Test.transport_error/2
+
+Simulates a network transport failure. Use this to test your error-handling paths.
+
+Supported reasons: `:timeout`, `:closed`, `:econnrefused`, `:nxdomain`
+
+```elixir
+test "handles timeout gracefully" do
+  HTTPower.Test.stub(fn conn ->
+    HTTPower.Test.transport_error(conn, :timeout)
+  end)
+
+  {:error, error} = HTTPower.get("https://api.example.com/slow")
+  assert error.reason == :test_transport_error
+  assert error.message =~ "timeout"
+end
+```
+
+## Blocked requests
+
+Any request that is not intercepted by a stub returns a network-blocked error:
+
+```elixir
+# With test_mode: true and no stub registered, real requests are blocked
+Application.put_env(:httpower, :test_mode, true)
+
+{:error, %HTTPower.Error{reason: :network_blocked}} =
+  HTTPower.get("https://real-api.com")
+```
+
+You can check the current test mode state with `HTTPower.test_mode?/0`:
+
+```elixir
+Application.put_env(:httpower, :test_mode, true)
+HTTPower.test_mode?()  # => true
+
+Application.put_env(:httpower, :test_mode, false)
+HTTPower.test_mode?()  # => false
+```
+
+## Cross-process stubs
+
+Stubs are associated with the test process that calls `HTTPower.Test.setup/0`. Processes spawned from the test — such as `Task.async` or `Task.async_stream` — automatically inherit the stub through `$callers` chain walking.
+
+For **pre-existing processes** like GenServers that were started before the test, use `HTTPower.Test.allow/2` to grant them access to the stub:
+
+```elixir
+setup do
+  HTTPower.Test.setup()
+  # Allow a named GenServer to use this test's stub
+  HTTPower.Test.allow(Process.whereis(MyApp.HttpWorker))
+end
+
+test "worker calls the API" do
+  HTTPower.Test.stub(fn conn ->
+    HTTPower.Test.json(conn, %{ok: true})
+  end)
+
+  assert {:ok, response} = MyApp.HttpWorker.fetch()
+end
+```
+
+Allowances are transitive: if you allow a GenServer, and that GenServer spawns a `Task`, the `Task` also sees the stub.
+
+## Complete test module example
+
+```elixir
+defmodule MyApp.PaymentClientTest do
+  use ExUnit.Case
+
+  setup do
+    HTTPower.Test.setup()
+  end
+
+  test "charges a card successfully" do
+    HTTPower.Test.stub(fn conn ->
+      assert conn.method == "POST"
+      assert conn.request_path == "/v1/charges"
+      HTTPower.Test.json(conn, %{id: "ch_abc", status: "succeeded"})
+    end)
+
+    assert {:ok, response} = MyApp.PaymentClient.charge(%{amount: 1000})
+    assert response.body["status"] == "succeeded"
+  end
+
+  test "handles gateway timeout" do
+    HTTPower.Test.stub(fn conn ->
+      HTTPower.Test.transport_error(conn, :timeout)
+    end)
+
+    assert {:error, error} = MyApp.PaymentClient.charge(%{amount: 1000})
+    assert error.reason == :test_transport_error
+  end
+
+  test "handles 402 payment required" do
+    HTTPower.Test.stub(fn conn ->
+      HTTPower.Test.json(conn, %{error: "card_declined"}, status: 402)
+    end)
+
+    assert {:ok, %{status: 402}} = MyApp.PaymentClient.charge(%{amount: 1000})
+  end
+end
+```

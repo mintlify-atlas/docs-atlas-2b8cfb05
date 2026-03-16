@@ -1,0 +1,233 @@
+---
+title: "PCI-Compliant Logging"
+description: "Opt-in structured logging with automatic sanitization of sensitive data including credit card numbers, authorization headers, and PII."
+keywords: ["logging", "PCI", "sanitization", "compliance", "structured logging", "httpower"]
+---
+
+HTTPower provides opt-in telemetry-based logging through `HTTPower.Logger`. It automatically redacts sensitive data from request and response logs, attaches structured metadata to every log entry, and generates unique correlation IDs for distributed tracing.
+
+Logging is **disabled by default** — nothing is logged until you call `HTTPower.Logger.attach/0,1`.
+
+## Quick start
+
+```elixir
+# lib/my_app/application.ex
+def start(_type, _args) do
+  HTTPower.Logger.attach()
+
+  children = [
+    # ... your supervision tree
+  ]
+
+  Supervisor.start_link(children, strategy: :one_for_one)
+end
+```
+
+Once attached, all HTTP requests are logged with automatic sanitization:
+
+```
+[HTTPower] [req_a1b2c3d4e5f6g7h8] → GET https://api.example.com/users headers=%{"authorization" => "[REDACTED]"}
+[HTTPower] [req_a1b2c3d4e5f6g7h8] ← 200 (45ms) body=%{"users" => [...]}
+```
+
+## Attach and detach
+
+```elixir
+# Attach with defaults from Application config
+HTTPower.Logger.attach()
+
+# Attach with runtime options (overrides Application config)
+HTTPower.Logger.attach(
+  level: :debug,
+  log_headers: true,
+  log_body: true,
+  sanitize_headers: ["x-custom-token"],
+  sanitize_body_fields: ["secret_key"]
+)
+
+# Detach (stops all HTTPower logging)
+HTTPower.Logger.detach()
+```
+
+Calling `attach/0` reads from `Application.get_env(:httpower, :logging, [])`. Calling `attach/1` merges the options you provide over the Application config.
+
+## Log output format
+
+Each HTTP interaction produces two log lines — one for the request and one for the response:
+
+**Request:**
+```
+[HTTPower] [req_a1b2c3d4e5f6g7h8] → POST https://api.example.com/charges headers=%{"content-type" => "application/json", "authorization" => "[REDACTED]"} body="{\"amount\": 100, \"card\": \"[REDACTED]\"}"
+```
+
+**Response:**
+```
+[HTTPower] [req_a1b2c3d4e5f6g7h8] ← 200 (78ms) body=%{"id" => "ch_abc123", "status" => "succeeded"}
+```
+
+**Exception:**
+```
+[HTTPower] [req_a1b2c3d4e5f6g7h8] EXCEPTION (30ms) error: %HTTPower.Error{reason: :timeout}
+```
+
+The correlation ID (`req_` + 16 hex characters) is consistent across the request and response lines. When used inside a Phoenix application, the logger reuses the existing `Logger.metadata()[:request_id]` rather than generating a new ID.
+
+## Structured metadata
+
+Every log entry sets machine-readable metadata via `Logger.metadata/1`. This enables querying in Datadog, Splunk, ELK, Loki, and similar systems.
+
+**Request metadata:**
+
+| Key | Type | Description |
+|---|---|---|
+| `httpower_correlation_id` | string | Unique request identifier (`req_…`) |
+| `httpower_event` | atom | `:request` |
+| `httpower_method` | atom | HTTP method (`:get`, `:post`, etc.) |
+| `httpower_url` | string | Request URL |
+| `httpower_headers` | map | Sanitized request headers (if `log_headers: true`) |
+| `httpower_body` | string | Sanitized request body (if `log_body: true`, truncated at 500 chars) |
+
+**Response metadata:**
+
+| Key | Type | Description |
+|---|---|---|
+| `httpower_correlation_id` | string | Matches the request correlation ID |
+| `httpower_event` | atom | `:response` |
+| `httpower_status` | integer | HTTP status code |
+| `httpower_duration_ms` | integer | Request duration in milliseconds |
+| `httpower_response_headers` | map | Sanitized response headers (if `log_headers: true`) |
+| `httpower_response_body` | string | Sanitized response body (if `log_body: true`, truncated at 500 chars) |
+
+**Exception metadata:**
+
+| Key | Type | Description |
+|---|---|---|
+| `httpower_correlation_id` | string | Request correlation ID |
+| `httpower_event` | atom | `:exception` |
+| `httpower_duration_ms` | integer | Time until exception |
+| `httpower_exception_kind` | atom | `:error`, `:exit`, or `:throw` |
+| `httpower_exception_reason` | string | Inspected exception reason |
+
+## Automatic sanitization
+
+HTTPower sanitizes sensitive data before it ever reaches the log output.
+
+### Headers
+
+The following headers are redacted to `"[REDACTED]"` (case-insensitive matching):
+
+```
+authorization, api-key, x-api-key, api_key, apikey,
+secret, token, x-auth-token, x-csrf-token, cookie, set-cookie
+```
+
+**Example:**
+
+```elixir
+HTTPower.get("https://api.example.com/users",
+  headers: %{"Authorization" => "Bearer secret-token"}
+)
+# Logs: headers=%{"authorization" => "[REDACTED]"}
+```
+
+### Body fields
+
+The following JSON body fields are redacted (case-insensitive matching):
+
+```
+password, passwd, pwd, secret, api_key, apikey, token,
+credit_card, creditcard, card_number, cardnumber,
+cvv, cvv2, cvc, pin, ssn, social_security
+```
+
+### Pattern matching
+
+In addition to named fields, two patterns are applied to string bodies:
+
+- **Credit card numbers** — Any 13–19 digit sequence that passes the [Luhn checksum](https://en.wikipedia.org/wiki/Luhn_algorithm) is replaced with `[REDACTED]`.
+- **CVV codes** — Sequences matching `cvv: 123` or `cvc: "456"` patterns are replaced with `[REDACTED]`.
+
+**Example:**
+
+```elixir
+HTTPower.post("https://payment-api.com/charge",
+  body: ~s({"card": "4111111111111111", "cvv": "123", "amount": 100})
+)
+# Logs: body="{\"card\": \"[REDACTED]\", \"cvv\": \"[REDACTED]\", \"amount\": 100}"
+```
+
+## Custom sanitization
+
+You can add additional headers and body fields to sanitize. Custom additions are **additive** — they supplement the defaults, they do not replace them.
+
+```elixir
+HTTPower.Logger.attach(
+  sanitize_headers: ["x-custom-token", "x-internal-secret"],
+  sanitize_body_fields: ["account_number", "routing_number"]
+)
+```
+
+Or via Application config:
+
+```elixir
+config :httpower, :logging,
+  level: :info,
+  log_headers: true,
+  log_body: true,
+  sanitize_headers: ["x-custom-token"],
+  sanitize_body_fields: ["account_number"]
+```
+
+<Note>
+  Custom sanitization fields are additive. The built-in defaults (`authorization`, `credit_card`, etc.) are always applied regardless of what you configure.
+</Note>
+
+## Log aggregation queries
+
+Because all metadata keys are prefixed with `httpower_`, queries are unambiguous in shared logging systems.
+
+**Datadog:**
+
+```
+# Slow requests
+@httpower_duration_ms:>1000
+
+# All 5xx errors
+@httpower_status:[500 TO 599]
+
+# Trace a specific request
+@httpower_correlation_id:"req_abc123"
+
+# POST requests only
+@httpower_method:post
+```
+
+**Splunk:**
+
+```
+httpower_duration_ms > 1000
+httpower_status >= 500
+httpower_correlation_id = "req_abc123"
+```
+
+## Configuration reference
+
+<ParamField query="level" type=":debug | :info | :warning | :error" default=":info">
+  Logger level used for request and response log lines. Exceptions are always logged at `:error`.
+</ParamField>
+
+<ParamField query="log_headers" type="boolean" default="true">
+  Include sanitized headers in log output and metadata.
+</ParamField>
+
+<ParamField query="log_body" type="boolean" default="true">
+  Include sanitized body in log output and metadata. Bodies longer than 500 characters are truncated.
+</ParamField>
+
+<ParamField query="sanitize_headers" type="list of strings">
+  Additional header names to redact. Added to the built-in defaults.
+</ParamField>
+
+<ParamField query="sanitize_body_fields" type="list of strings">
+  Additional JSON body field names to redact. Added to the built-in defaults.
+</ParamField>

@@ -1,0 +1,145 @@
+---
+title: "HTTPower.Adapter.Finch"
+description: "High-performance HTTP adapter built on Mint and NimblePool — the default HTTPower adapter."
+---
+
+`HTTPower.Adapter.Finch` is the default HTTPower adapter. It delegates HTTP requests to [Finch](https://github.com/sneako/finch), a performance-focused client built on [Mint](https://github.com/elixir-mint/mint) and [NimblePool](https://github.com/dashbitco/nimble_pool) that provides explicit connection pooling and excellent throughput characteristics.
+
+## Installation
+
+Add Finch to your dependencies:
+
+```elixir
+# mix.exs
+defp deps do
+  [
+    {:httpower, "~> 0.1"},
+    {:finch, ">= 0.19.0"}
+  ]
+end
+```
+
+Finch is **auto-selected** as the adapter when it is present in your application. No explicit adapter configuration is required.
+
+<Note>
+The adapter module is compiled conditionally via `Code.ensure_loaded?(Finch)`. If Finch is not in your dependency tree, the module will not exist and HTTPower will fall back to the next available adapter.
+</Note>
+
+---
+
+## How Requests Are Made
+
+All adapters, including Finch, run through `HTTPower.TestInterceptor` first. In test mode the interceptor short-circuits the call; in production it proceeds to the Finch HTTP layer:
+
+```
+HTTPower.get/2
+  └─> TestInterceptor.intercept/4
+        └─> :continue → HTTPower.Adapter.Finch.do_request/5
+              └─> Finch.build/4 + Finch.request/3
+```
+
+---
+
+## Configuration Options
+
+These options are read from the `opts` keyword list passed to `request/5`:
+
+<ParamField path="timeout" type="integer">
+  Request timeout in **seconds**. Converted to milliseconds internally as `receive_timeout: timeout * 1000`. Default: `60`.
+</ParamField>
+
+<ParamField path="ssl_verify" type="boolean">
+  Enable SSL peer verification for HTTPS requests. When `false`, sets `verify: :verify_none`. Default: `true`.
+</ParamField>
+
+<ParamField path="proxy" type=":system | nil | keyword()">
+  Proxy configuration passed to Finch's `conn_opts`.
+  - `:system` — use system proxy settings (default)
+  - `nil` — no proxy
+  - keyword list — custom proxy options forwarded directly to Finch
+</ParamField>
+
+---
+
+## Pool Configuration
+
+Finch connection pools are configured globally in your application config under `:finch_pools`:
+
+```elixir
+config :httpower, :finch_pools,
+  default: [
+    size: 10,
+    count: System.schedulers_online(),
+    conn_opts: [
+      timeout: 5_000
+    ]
+  ]
+```
+
+HTTPower starts a named Finch instance (`HTTPower.Finch`) using this pool configuration as part of its supervision tree. All requests made through the Finch adapter use this supervised instance.
+
+---
+
+## Response Format
+
+Finch responses are converted from `%Finch.Response{}` to `%HTTPower.Response{}`. Headers are normalized from a list of `{"key", "value"}` tuples to a map of `%{"key" => ["value1", "value2"]}` — multiple values for the same header are preserved as a list.
+
+Response bodies are parsed with `Jason.decode/1`. If the body is not valid JSON it is returned as a raw binary string.
+
+---
+
+## Testing
+
+The Finch adapter integrates with `HTTPower.Test` for adapter-agnostic test mocking. You do not need Finch-specific test utilities:
+
+```elixir
+defmodule MyApp.ApiTest do
+  use ExUnit.Case
+
+  setup do
+    HTTPower.Test.setup()
+  end
+
+  test "fetches data" do
+    HTTPower.Test.stub(fn conn ->
+      HTTPower.Test.json(conn, %{data: "value"})
+    end)
+
+    {:ok, response} = HTTPower.get("https://api.example.com/data")
+    assert response.status == 200
+    assert response.body["data"] == "value"
+  end
+end
+```
+
+See [`HTTPower.Test`](/api/test) for full documentation.
+
+---
+
+## Usage
+
+```elixir
+# Default — Finch is selected automatically
+{:ok, response} = HTTPower.get("https://api.example.com/users")
+
+# Explicit adapter selection
+{:ok, response} = HTTPower.get("https://api.example.com/users",
+  adapter: HTTPower.Adapter.Finch
+)
+
+# With options
+{:ok, response} = HTTPower.get("https://api.example.com/users",
+  adapter: HTTPower.Adapter.Finch,
+  timeout: 30,
+  ssl_verify: true
+)
+
+# Per-client configuration
+client = HTTPower.new(
+  base_url: "https://api.example.com",
+  adapter: HTTPower.Adapter.Finch,
+  timeout: 10
+)
+
+{:ok, response} = HTTPower.get(client, "/users")
+```

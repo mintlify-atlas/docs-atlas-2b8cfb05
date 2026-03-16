@@ -1,0 +1,128 @@
+---
+title: "HTTPower.Response"
+description: "Struct representing a successful HTTP response from any HTTPower adapter."
+---
+
+`HTTPower.Response` is the value inside the `{:ok, response}` tuple returned by every HTTP method. It provides a uniform representation of the HTTP response regardless of which underlying adapter (Finch, Req, Tesla) executed the request.
+
+```elixir
+@type t :: %HTTPower.Response{
+  status: integer(),
+  headers: %{optional(String.t()) => [String.t()]},
+  body: term()
+}
+```
+
+---
+
+## Fields
+
+<ResponseField name="status" type="integer()" required>
+  The HTTP status code returned by the server. Standard HTTP integers: `200`, `201`, `400`, `404`, `500`, etc.
+
+  HTTPower returns all status codes as `{:ok, response}` — including 4xx and 5xx. Check this field to determine whether the request succeeded in a business logic sense.
+</ResponseField>
+
+<ResponseField name="headers" type="%{optional(String.t()) => [String.t()]}" required>
+  Response headers as a map from header name strings to a list of value strings.
+
+  Header names are normalized to lowercase by adapters. Multiple values for the same header name are represented as a list.
+</ResponseField>
+
+<ResponseField name="body" type="term()" required>
+  The parsed response body. The exact type depends on the adapter and its configuration:
+  - For JSON responses decoded by the adapter: a `map()` or `list()`
+  - For raw text/binary responses: a `String.t()` or `binary()`
+  - For responses with no body (e.g., `204 No Content`): `nil` or `""`
+</ResponseField>
+
+---
+
+## Pattern Matching
+
+Because `HTTPower.Response` is a plain struct, it works naturally with Elixir pattern matching.
+
+### Match on status range
+
+```elixir
+case HTTPower.get("https://api.example.com/users") do
+  {:ok, %HTTPower.Response{status: status, body: body}} when status in 200..299 ->
+    # Successful response
+    {:ok, body}
+
+  {:ok, %HTTPower.Response{status: 404}} ->
+    {:error, :not_found}
+
+  {:ok, %HTTPower.Response{status: 401}} ->
+    {:error, :unauthorized}
+
+  {:ok, %HTTPower.Response{status: status, body: body}} when status in 500..599 ->
+    # Server error (may have been retried already)
+    {:error, {:server_error, status, body}}
+
+  {:error, %HTTPower.Error{} = error} ->
+    # Transport/network error — no HTTP response was received
+    {:error, error}
+end
+```
+
+### Access headers
+
+```elixir
+{:ok, response} = HTTPower.get("https://api.example.com/data")
+
+# Headers are lowercase string keys
+content_type = response.headers["content-type"]
+retry_after = response.headers["retry-after"]
+
+# Multiple values for a header
+set_cookie_values = response.headers["set-cookie"]  # ["a=1; ...", "b=2; ..."]
+```
+
+### Inline status check helpers
+
+```elixir
+defmodule MyApp.HTTP do
+  def ok?(%HTTPower.Response{status: status}), do: status in 200..299
+  def not_found?(%HTTPower.Response{status: 404}), do: true
+  def not_found?(%HTTPower.Response{}), do: false
+end
+
+{:ok, response} = HTTPower.get("https://api.example.com/users/42")
+
+if MyApp.HTTP.ok?(response) do
+  process(response.body)
+end
+```
+
+### Matching with short map syntax
+
+You can use the short map pattern to match without the full struct name:
+
+```elixir
+with {:ok, %{status: 200, body: body}} <- HTTPower.get(url),
+     {:ok, parsed} <- Jason.decode(body) do
+  {:ok, parsed}
+end
+```
+
+---
+
+## Full Struct Definition
+
+```elixir
+# lib/httpower/response.ex
+defmodule HTTPower.Response do
+  defstruct [
+    :status,
+    :headers,
+    :body
+  ]
+
+  @type t :: %__MODULE__{
+    status: integer(),
+    headers: %{optional(String.t()) => [String.t()]},
+    body: term()
+  }
+end
+```

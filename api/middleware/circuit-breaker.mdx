@@ -1,0 +1,240 @@
+---
+title: "HTTPower.Middleware.CircuitBreaker"
+description: "GenServer-backed circuit breaker protecting against cascading failures from degraded services."
+---
+
+`HTTPower.Middleware.CircuitBreaker` implements the circuit breaker pattern using a GenServer with an ETS table for low-latency state reads. It guards your application against cascading failures by tracking request outcomes in a sliding window and short-circuiting calls when a service is failing.
+
+## State Machine
+
+The circuit moves through three states:
+
+| State | Behavior | Transition |
+|-------|----------|------------|
+| `:closed` | Requests pass through; failures are tracked | → `:open` when failures exceed threshold |
+| `:open` | All requests fail immediately with `:service_unavailable` | → `:half_open` after `timeout` ms |
+| `:half_open` | Up to `half_open_requests` test requests are allowed | → `:closed` on success; → `:open` on failure |
+
+## Configuration
+
+```elixir
+# Global configuration (compile-time cached for performance)
+config :httpower, :circuit_breaker,
+  enabled: true,
+  failure_threshold: 5,
+  failure_threshold_percentage: 50,
+  window_size: 10,
+  timeout: 60_000,
+  half_open_requests: 1
+```
+
+<AccordionGroup>
+  <Accordion title="Configuration options">
+    <ParamField path="enabled" type="boolean">
+      Enable or disable the circuit breaker. Default: `false`.
+    </ParamField>
+    <ParamField path="failure_threshold" type="pos_integer">
+      Number of failures after which the circuit opens. Default: `5`.
+    </ParamField>
+    <ParamField path="failure_threshold_percentage" type="pos_integer">
+      Alternative to `failure_threshold`: open the circuit when the failure rate in the window reaches this percentage. Requires `window_size` requests to have been observed before triggering. Default: `nil` (disabled).
+    </ParamField>
+    <ParamField path="window_size" type="pos_integer">
+      Number of most-recent requests to track when evaluating the failure rate. Default: `10`.
+    </ParamField>
+    <ParamField path="timeout" type="pos_integer">
+      Milliseconds the circuit stays open before transitioning to `:half_open`. Default: `60_000`.
+    </ParamField>
+    <ParamField path="half_open_requests" type="pos_integer">
+      Number of probe requests allowed through in the `:half_open` state. All must succeed to close the circuit. Default: `1`.
+    </ParamField>
+  </Accordion>
+</AccordionGroup>
+
+## Usage
+
+```elixir
+# Per-client circuit breaker
+client = HTTPower.new(
+  base_url: "https://api.example.com",
+  circuit_breaker: [
+    enabled: true,
+    failure_threshold: 3,
+    timeout: 30_000
+  ]
+)
+
+# Per-request circuit breaker key (groups multiple URLs under one circuit)
+HTTPower.get(url, circuit_breaker_key: "payment_api")
+```
+
+---
+
+## Public Functions
+
+### `get_state/1`
+
+Returns the current state of a circuit without modifying it. Reads directly from ETS for O(1) performance.
+
+```elixir
+@spec get_state(circuit_key()) :: state() | nil
+```
+
+<ParamField path="circuit_key" type="String.t()" required>
+  The key identifying the circuit. Typically a hostname (e.g., `"api.example.com"`) or a custom string passed via `:circuit_breaker_key`.
+</ParamField>
+
+**Returns** `:closed | :open | :half_open | nil`. Returns `nil` if no circuit state has been recorded yet for this key.
+
+```elixir
+HTTPower.Middleware.CircuitBreaker.get_state("api.example.com")
+# => :closed
+
+HTTPower.Middleware.CircuitBreaker.get_state("unknown-service")
+# => nil
+```
+
+---
+
+### `open_circuit/1`
+
+Manually forces a circuit into the `:open` state. Subsequent requests for this key will fail immediately with `:service_unavailable` until the `timeout` elapses.
+
+Useful for maintenance windows or manual intervention when you know a downstream service is unavailable.
+
+```elixir
+@spec open_circuit(circuit_key()) :: :ok
+```
+
+<ParamField path="circuit_key" type="String.t()" required>
+  The key identifying the circuit to open.
+</ParamField>
+
+```elixir
+HTTPower.Middleware.CircuitBreaker.open_circuit("payment_api")
+# => :ok
+
+HTTPower.Middleware.CircuitBreaker.get_state("payment_api")
+# => :open
+```
+
+---
+
+### `close_circuit/1`
+
+Manually forces a circuit into the `:closed` state, clearing all recorded request history and resetting `half_open_attempts` to zero.
+
+Useful after confirming a service has recovered or for resetting state in tests.
+
+```elixir
+@spec close_circuit(circuit_key()) :: :ok
+```
+
+<ParamField path="circuit_key" type="String.t()" required>
+  The key identifying the circuit to close.
+</ParamField>
+
+```elixir
+HTTPower.Middleware.CircuitBreaker.close_circuit("payment_api")
+# => :ok
+
+HTTPower.Middleware.CircuitBreaker.get_state("payment_api")
+# => :closed
+```
+
+---
+
+### `reset_circuit/1`
+
+Completely removes a circuit's state from ETS, as if it never existed. The next request will create a fresh circuit in the `:closed` state.
+
+```elixir
+@spec reset_circuit(circuit_key()) :: :ok
+```
+
+<ParamField path="circuit_key" type="String.t()" required>
+  The key identifying the circuit to reset.
+</ParamField>
+
+```elixir
+HTTPower.Middleware.CircuitBreaker.reset_circuit("payment_api")
+# => :ok
+
+HTTPower.Middleware.CircuitBreaker.get_state("payment_api")
+# => nil
+```
+
+<Note>
+`reset_circuit/1` differs from `close_circuit/1`: `close_circuit/1` transitions to `:closed` with zeroed history, while `reset_circuit/1` removes the entry entirely. Both result in subsequent requests being allowed through.
+</Note>
+
+---
+
+### `record_success/2` and `record_failure/2`
+
+Record outcomes when using the circuit breaker outside the standard HTTPower pipeline (e.g., wrapping non-HTTP calls).
+
+```elixir
+@spec record_success(circuit_key(), circuit_breaker_config()) :: :ok
+@spec record_failure(circuit_key(), circuit_breaker_config()) :: :ok
+```
+
+Both functions are no-ops when the circuit breaker is disabled. Recording is performed asynchronously via `GenServer.cast` for minimal latency impact on the caller.
+
+```elixir
+case call_external_service() do
+  {:ok, result} ->
+    HTTPower.Middleware.CircuitBreaker.record_success("my_service")
+    {:ok, result}
+  {:error, reason} ->
+    HTTPower.Middleware.CircuitBreaker.record_failure("my_service")
+    {:error, reason}
+end
+```
+
+---
+
+## GenServer Implementation
+
+The circuit breaker runs as a named GenServer (`HTTPower.Middleware.CircuitBreaker`) started as part of the HTTPower supervision tree.
+
+**ETS table:** `:httpower_circuit_breaker`
+- `:public` — adapters read state directly without going through the GenServer
+- `read_concurrency: true` / `write_concurrency: true` — optimized for high-throughput scenarios
+- `heir: :none` — table is destroyed if the GenServer crashes, preventing orphaned state
+
+**State reads** bypass the GenServer (direct ETS lookup for O(1) latency). **State writes** (recording outcomes, manual open/close) go through the GenServer to serialize mutations and prevent race conditions.
+
+---
+
+## Telemetry Events
+
+| Event | Measurements | Metadata |
+|-------|-------------|----------|
+| `[:httpower, :circuit_breaker, :open]` | `%{}` | `%{circuit_key: key}` |
+| `[:httpower, :circuit_breaker, :state_change]` | `%{timestamp: t}` | `%{circuit_key: key, from_state: s, to_state: s, failure_count: n, failure_rate: f}` |
+
+---
+
+## Complete Example
+
+```elixir
+# After 5 failures within the window, the circuit opens
+for _ <- 1..5 do
+  {:error, _} = HTTPower.get("https://failing-api.com/endpoint")
+end
+
+# Subsequent requests fail immediately without hitting the network
+{:error, %HTTPower.Error{reason: :service_unavailable}} =
+  HTTPower.get("https://failing-api.com/endpoint")
+
+# Check current state
+:open = HTTPower.Middleware.CircuitBreaker.get_state("failing-api.com")
+
+# After 60 seconds, the circuit transitions to :half_open automatically.
+# The next successful request closes it.
+:timer.sleep(60_000)
+{:ok, _} = HTTPower.get("https://failing-api.com/endpoint")
+
+:closed = HTTPower.Middleware.CircuitBreaker.get_state("failing-api.com")
+```

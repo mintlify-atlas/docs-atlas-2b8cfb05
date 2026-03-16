@@ -1,0 +1,398 @@
+---
+title: "Telemetry & Observability"
+description: "Comprehensive telemetry events for HTTP requests, retries, rate limiting, circuit breakers, and deduplication using Elixir's :telemetry library."
+keywords: ["telemetry", "observability", "prometheus", "opentelemetry", "metrics", "httpower"]
+---
+
+HTTPower emits telemetry events through Elixir's built-in [`:telemetry`](https://hexdocs.pm/telemetry/) library. Every significant operation — HTTP requests, retries, rate limit decisions, circuit breaker state changes, and deduplication — produces a structured event you can attach to with any handler.
+
+## Quick start
+
+```elixir
+:telemetry.attach_many(
+  "httpower-handler",
+  [
+    [:httpower, :request, :start],
+    [:httpower, :request, :stop],
+    [:httpower, :retry, :attempt]
+  ],
+  fn event, measurements, metadata, _config ->
+    IO.inspect({event, measurements, metadata})
+  end,
+  nil
+)
+```
+
+## Event reference
+
+<AccordionGroup>
+  <Accordion title="HTTP Request Lifecycle">
+    HTTPower uses `:telemetry.span/3` to emit `:start`, `:stop`, and `:exception` events for every HTTP request.
+
+    ### `[:httpower, :request, :start]`
+
+    Emitted when an HTTP request begins.
+
+    **Measurements:**
+    - `system_time` — System time when the request started (integer, nanoseconds)
+
+    **Metadata:**
+    - `method` — HTTP method (`:get`, `:post`, `:put`, `:delete`)
+    - `url` — Sanitized URL (query params and fragments stripped)
+
+    ```elixir
+    # Example payload
+    event:        [:httpower, :request, :start]
+    measurements: %{system_time: 1640995200000000000}
+    metadata:     %{method: :get, url: "https://api.example.com/users"}
+    ```
+
+    ---
+
+    ### `[:httpower, :request, :stop]`
+
+    Emitted when an HTTP request completes (success or error).
+
+    **Measurements:**
+    - `duration` — Request duration in native time units (convert with `System.convert_time_unit/3`)
+    - `monotonic_time` — Monotonic time when the request completed
+
+    **Metadata:**
+    - `method` — HTTP method
+    - `url` — Sanitized URL
+    - `status` — HTTP status code (present on successful responses)
+    - `error_type` — Error reason atom (present on failed requests)
+    - `retry_count` — Number of retries performed (default: 0)
+
+    ```elixir
+    # Success example
+    event:        [:httpower, :request, :stop]
+    measurements: %{duration: 45_000_000, monotonic_time: -576460751234567890}
+    metadata:     %{method: :get, url: "https://api.example.com/users", status: 200, retry_count: 0}
+
+    # Error example
+    event:        [:httpower, :request, :stop]
+    measurements: %{duration: 5_000_000, monotonic_time: -576460751234567890}
+    metadata:     %{method: :post, url: "https://api.example.com/orders", error_type: :timeout, retry_count: 3}
+    ```
+
+    ---
+
+    ### `[:httpower, :request, :exception]`
+
+    Emitted when an unhandled exception occurs during request processing.
+
+    **Measurements:**
+    - `duration` — Request duration in native time units
+
+    **Metadata:**
+    - `method` — HTTP method
+    - `url` — Sanitized URL
+    - `kind` — Exception kind (`:throw`, `:error`, `:exit`)
+    - `reason` — Exception reason
+    - `stacktrace` — Exception stacktrace
+  </Accordion>
+
+  <Accordion title="Retry">
+    ### `[:httpower, :retry, :attempt]`
+
+    Emitted before each retry attempt.
+
+    **Measurements:**
+    - `attempt_number` — Current attempt number (2 for first retry, 3 for second, etc.)
+    - `delay_ms` — Delay before this retry in milliseconds
+
+    **Metadata:**
+    - `method` — HTTP method
+    - `url` — Sanitized URL
+    - `reason` — Reason for retry (e.g., `:timeout`, `{:http_status, 503}`)
+
+    ```elixir
+    event:        [:httpower, :retry, :attempt]
+    measurements: %{attempt_number: 2, delay_ms: 1000}
+    metadata:     %{method: :get, url: "https://api.example.com/users", reason: {:http_status, 503}}
+    ```
+  </Accordion>
+
+  <Accordion title="Rate Limiter">
+    ### `[:httpower, :rate_limit, :ok]`
+
+    Emitted when a request passes rate limiting and a token is consumed.
+
+    **Measurements:** `tokens_remaining` (float), `wait_time_ms` (always 0)
+
+    **Metadata:** `bucket_key` (string)
+
+    ```elixir
+    event:        [:httpower, :rate_limit, :ok]
+    measurements: %{tokens_remaining: 45.5, wait_time_ms: 0}
+    metadata:     %{bucket_key: "api.example.com"}
+    ```
+
+    ---
+
+    ### `[:httpower, :rate_limit, :wait]`
+
+    Emitted when the bucket is empty and the `:wait` strategy causes the request to block.
+
+    **Measurements:** `wait_time_ms` (integer)
+
+    **Metadata:** `bucket_key` (string), `strategy` (`:wait`)
+
+    ```elixir
+    event:        [:httpower, :rate_limit, :wait]
+    measurements: %{wait_time_ms: 250}
+    metadata:     %{bucket_key: "api.example.com", strategy: :wait}
+    ```
+
+    ---
+
+    ### `[:httpower, :rate_limit, :exceeded]`
+
+    Emitted when the bucket is empty and the `:error` strategy is used.
+
+    **Measurements:** `tokens_remaining` (always 0)
+
+    **Metadata:** `bucket_key` (string), `strategy` (`:error`)
+
+    ```elixir
+    event:        [:httpower, :rate_limit, :exceeded]
+    measurements: %{tokens_remaining: 0}
+    metadata:     %{bucket_key: "api.example.com", strategy: :error}
+    ```
+  </Accordion>
+
+  <Accordion title="Circuit Breaker">
+    ### `[:httpower, :circuit_breaker, :state_change]`
+
+    Emitted when the circuit breaker transitions between states.
+
+    **Measurements:** `timestamp` (system time)
+
+    **Metadata:**
+    - `circuit_key` — Circuit breaker identifier
+    - `from_state` — Previous state (`:closed`, `:open`, or `:half_open`)
+    - `to_state` — New state
+    - `failure_count` — Number of failures in the sliding window
+    - `failure_rate` — Failure rate as a decimal (e.g., `0.83` = 83%)
+
+    ```elixir
+    event:        [:httpower, :circuit_breaker, :state_change]
+    measurements: %{timestamp: 1640995200000000000}
+    metadata:     %{
+      circuit_key:   "payment.api.example.com",
+      from_state:    :closed,
+      to_state:      :open,
+      failure_count: 5,
+      failure_rate:  0.83
+    }
+    ```
+
+    ---
+
+    ### `[:httpower, :circuit_breaker, :open]`
+
+    Emitted for every request that is blocked by an open circuit.
+
+    **Measurements:** `%{}` (empty)
+
+    **Metadata:** `circuit_key` (string)
+
+    ```elixir
+    event:        [:httpower, :circuit_breaker, :open]
+    measurements: %{}
+    metadata:     %{circuit_key: "payment.api.example.com"}
+    ```
+  </Accordion>
+
+  <Accordion title="Deduplication">
+    ### `[:httpower, :dedup, :execute]`
+
+    Emitted when a request is the first occurrence and will be executed normally.
+
+    **Measurements:** `%{}` (empty)
+
+    **Metadata:** `dedup_key` (string — the SHA-256 hash or custom key)
+
+    ---
+
+    ### `[:httpower, :dedup, :wait]`
+
+    Emitted when a duplicate request finishes waiting for the in-flight request.
+
+    **Measurements:** `wait_time_ms` (integer)
+
+    **Metadata:** `dedup_key` (string)
+
+    ```elixir
+    event:        [:httpower, :dedup, :wait]
+    measurements: %{wait_time_ms: 450}
+    metadata:     %{dedup_key: "2cdff299ad44f172e45a54feaafdac27f230a63471469182a64049689e6bf24b"}
+    ```
+
+    ---
+
+    ### `[:httpower, :dedup, :cache_hit]`
+
+    Emitted when a request returns a completed response from the dedup cache (within the 500 ms TTL window).
+
+    **Measurements:** `%{}` (empty)
+
+    **Metadata:** `dedup_key` (string)
+  </Accordion>
+</AccordionGroup>
+
+## Integration examples
+
+### Custom logging handler
+
+```elixir
+:telemetry.attach(
+  "httpower-logger",
+  [:httpower, :request, :stop],
+  fn _event, measurements, metadata, _config ->
+    duration_ms = System.convert_time_unit(measurements.duration, :native, :millisecond)
+    status = Map.get(metadata, :status, "error")
+    method = metadata.method |> to_string() |> String.upcase()
+
+    Logger.info("HTTP #{method} #{metadata.url} - #{status} (#{duration_ms}ms)")
+  end,
+  nil
+)
+```
+
+### Prometheus metrics
+
+Using [`telemetry_metrics`](https://hexdocs.pm/telemetry_metrics/) and [`telemetry_metrics_prometheus`](https://hexdocs.pm/telemetry_metrics_prometheus/):
+
+```elixir
+# lib/my_app/telemetry.ex
+defmodule MyApp.Telemetry do
+  use Supervisor
+  import Telemetry.Metrics
+
+  def start_link(arg), do: Supervisor.start_link(__MODULE__, arg, name: __MODULE__)
+
+  def init(_arg) do
+    children = [{TelemetryMetricsPrometheus, [metrics: metrics()]}]
+    Supervisor.init(children, strategy: :one_for_one)
+  end
+
+  defp metrics do
+    [
+      # Request duration histogram
+      distribution(
+        "httpower.request.duration",
+        event_name: [:httpower, :request, :stop],
+        measurement: :duration,
+        unit: {:native, :millisecond},
+        tags: [:method, :status],
+        tag_values: fn metadata ->
+          %{
+            method: metadata.method,
+            status: Map.get(metadata, :status, "error")
+          }
+        end
+      ),
+
+      # Request count
+      counter(
+        "httpower.request.count",
+        event_name: [:httpower, :request, :stop],
+        tags: [:method, :status]
+      ),
+
+      # Retry attempts
+      counter(
+        "httpower.retry.attempts",
+        event_name: [:httpower, :retry, :attempt],
+        tags: [:method, :reason],
+        tag_values: fn metadata ->
+          reason =
+            case metadata.reason do
+              {:http_status, status} -> "http_#{status}"
+              atom when is_atom(atom) -> to_string(atom)
+              _ -> "unknown"
+            end
+          %{method: metadata.method, reason: reason}
+        end
+      ),
+
+      # Circuit breaker state changes
+      counter(
+        "httpower.circuit_breaker.state_changes",
+        event_name: [:httpower, :circuit_breaker, :state_change],
+        tags: [:from_state, :to_state]
+      ),
+
+      # Rate limit exceeded
+      counter(
+        "httpower.rate_limit.exceeded",
+        event_name: [:httpower, :rate_limit, :exceeded],
+        tags: [:bucket_key]
+      )
+    ]
+  end
+end
+```
+
+### OpenTelemetry
+
+Using [`opentelemetry_telemetry`](https://hexdocs.pm/opentelemetry_telemetry/):
+
+```elixir
+# lib/my_app/application.ex
+defmodule MyApp.Application do
+  use Application
+
+  def start(_type, _args) do
+    # Register HTTPower as an OpenTelemetry tracer.
+    # This automatically creates spans for all HTTPower telemetry events.
+    OpentelemetryTelemetry.register_application_tracer(:httpower)
+
+    children = [
+      # ... your supervision tree
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one, name: MyApp.Supervisor)
+  end
+end
+```
+
+HTTPower telemetry events map to OpenTelemetry spans with the following attributes:
+
+- HTTP requests → spans with `method`, `url`, `status`
+- Retries → span events
+- Circuit breaker state changes → span events
+- Rate limiting → span attributes
+
+## Best practices
+
+**Convert duration units.** The `duration` measurement is in native time units. Always convert before using:
+
+```elixir
+duration_ms = System.convert_time_unit(measurements.duration, :native, :millisecond)
+```
+
+**Keep tag cardinality low.** Avoid using `:url` as a metric tag — it produces unbounded cardinality. Prefer `:method` and `:status`. HTTPower automatically strips query strings and fragments from URLs in telemetry metadata to help with this.
+
+**Defend against handler crashes.** Telemetry handlers that crash are automatically detached by the `:telemetry` library. Wrap your logic in a rescue:
+
+```elixir
+def handle_event(event, measurements, metadata, _config) do
+  # your logic
+rescue
+  exception ->
+    Logger.error("Telemetry handler error: #{inspect(exception)}")
+    :ok
+end
+```
+
+**Detach handlers in tests** to avoid interference between test cases:
+
+```elixir
+setup do
+  on_exit(fn -> :telemetry.detach("my-handler-id") end)
+  :ok
+end
+```

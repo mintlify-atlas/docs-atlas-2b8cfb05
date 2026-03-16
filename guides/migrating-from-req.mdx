@@ -1,0 +1,500 @@
+---
+title: 'Migrating from Req'
+description: "Add HTTPower's production reliability features to your Req-based application with minimal code changes."
+keywords: ['req', 'migration', 'circuit breaker', 'rate limiting', 'retry']
+---
+
+This guide shows you how to add HTTPower's production reliability features to your Req-based application.
+
+Since HTTPower uses Req as its default adapter, migration is straightforward. HTTPower adds circuit breaker, rate limiting, PCI-compliant logging, and enhanced retry logic on top of Req's foundation.
+
+## Prerequisites
+
+- Existing Elixir application using Req
+- Req `~> 0.4.0` or higher
+
+## Migration steps
+
+<Steps>
+  <Step title="Add HTTPower dependency">
+
+Update your `mix.exs`:
+
+```elixir mix.exs
+def deps do
+  [
+    {:req, "~> 0.4.0"},         # Your existing Req dependency
+    {:httpower, "~> 0.5.0"}     # Add HTTPower
+  ]
+end
+```
+
+Run `mix deps.get`.
+
+  </Step>
+  <Step title="Replace direct Req calls">
+
+The simplest migration is to replace `Req` calls with `HTTPower`:
+
+<CodeGroup>
+```elixir Before (Req)
+defmodule MyApp.ApiClient do
+  def fetch_users do
+    Req.get!("https://api.example.com/users")
+  end
+
+  def create_user(params) do
+    Req.post!("https://api.example.com/users", json: params)
+  end
+end
+```
+
+```elixir After (HTTPower)
+defmodule MyApp.ApiClient do
+  def fetch_users do
+    case HTTPower.get("https://api.example.com/users") do
+      {:ok, response} -> {:ok, response}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  def create_user(params) do
+    HTTPower.post("https://api.example.com/users",
+      body: Jason.encode!(params),
+      headers: %{"content-type" => "application/json"}
+    )
+  end
+end
+```
+</CodeGroup>
+
+<Note>
+HTTPower always returns `{:ok, response}` or `{:error, error}` tuples — it never raises. This differs from `Req.get!/1` which raises on error.
+</Note>
+
+  </Step>
+  <Step title="Migrate Req.new() clients">
+
+If you use `Req.new()` with options, wrap your existing configuration with `HTTPower.new()`:
+
+<CodeGroup>
+```elixir Before (Req.new with options)
+defmodule MyApp.GithubClient do
+  def client do
+    Req.new(
+      base_url: "https://api.github.com",
+      headers: [{"user-agent", "MyApp/1.0"}],
+      retry: :transient
+    )
+  end
+
+  def get_repo(owner, repo) do
+    Req.get!(client(), url: "/repos/#{owner}/#{repo}")
+  end
+end
+```
+
+```elixir After (HTTPower.new with Req options)
+defmodule MyApp.GithubClient do
+  def client do
+    HTTPower.new(
+      base_url: "https://api.github.com",
+      headers: %{"user-agent" => "MyApp/1.0"},
+      # HTTPower handles retries — disable Req's built-in retry
+      retry: false
+    )
+  end
+
+  def get_repo(owner, repo) do
+    HTTPower.get(client(), "/repos/#{owner}/#{repo}")
+  end
+end
+```
+</CodeGroup>
+
+  </Step>
+  <Step title="Add HTTPower reliability features">
+
+Now add circuit breaker, rate limiting, and retry configuration:
+
+```elixir
+defmodule MyApp.GithubClient do
+  def client do
+    HTTPower.new(
+      base_url: "https://api.github.com",
+      headers: %{"user-agent" => "MyApp/1.0"},
+
+      # HTTPower's retry with exponential backoff
+      max_retries: 3,
+      base_delay: 1000,
+
+      # Circuit breaker
+      circuit_breaker: [
+        failure_threshold: 5,
+        timeout: 60_000
+      ],
+
+      # Rate limiting (GitHub API is 60 req/min unauthenticated)
+      rate_limit: [
+        requests: 60,
+        per: :minute
+      ]
+    )
+  end
+end
+```
+
+  </Step>
+  <Step title="Configure globally (recommended)">
+
+Configure reliability patterns globally in `config/config.exs` and simplify each client:
+
+```elixir config/config.exs
+config :httpower,
+  max_retries: 3,
+  base_delay: 1000,
+  max_delay: 30000,
+  retry_safe: false,
+
+  circuit_breaker: [
+    enabled: true,
+    failure_threshold: 5,
+    window_size: 10,
+    timeout: 60_000
+  ],
+
+  rate_limit: [
+    enabled: true,
+    requests: 100,
+    per: :minute,
+    strategy: :wait
+  ],
+
+  logging: [
+    enabled: true,
+    level: :info
+  ]
+```
+
+Your client code becomes minimal:
+
+```elixir
+defmodule MyApp.GithubClient do
+  def client do
+    HTTPower.new(
+      base_url: "https://api.github.com",
+      headers: %{"user-agent" => "MyApp/1.0"}
+    )
+  end
+end
+```
+
+  </Step>
+  <Step title="Update tests">
+
+HTTPower maintains compatibility with `Req.Test`:
+
+<CodeGroup>
+```elixir Before (Req.Test)
+test "fetches users" do
+  Req.Test.stub(MyApp, fn conn ->
+    Req.Test.json(conn, %{"users" => []})
+  end)
+
+  client = Req.new(plug: {Req.Test, MyApp})
+  assert %Req.Response{status: 200} = Req.get!(client, url: "/users")
+end
+```
+
+```elixir After (HTTPower with Req.Test)
+# In test_helper.exs
+Application.put_env(:httpower, :test_mode, true)
+
+# In your tests
+test "fetches users" do
+  Req.Test.stub(HTTPower, fn conn ->
+    Req.Test.json(conn, %{"users" => []})
+  end)
+
+  assert {:ok, %{status: 200}} = HTTPower.get("/users",
+    plug: {Req.Test, HTTPower}
+  )
+end
+```
+</CodeGroup>
+
+  </Step>
+</Steps>
+
+## Key differences
+
+### Error handling
+
+HTTPower always returns result tuples. There is no bang variant that raises:
+
+<CodeGroup>
+```elixir Req
+# Raises on error
+response = Req.get!("https://api.example.com")
+
+# Returns result tuple
+{:ok, response} = Req.get("https://api.example.com")
+```
+
+```elixir HTTPower
+# Always returns a result tuple (never raises)
+{:ok, response} = HTTPower.get("https://api.example.com")
+{:error, error} = HTTPower.get("https://unreachable.com")
+```
+</CodeGroup>
+
+### Retry behavior
+
+| Feature | Req | HTTPower |
+|---|---|---|
+| Default retries | 3 (`:transient`) | Configurable via `max_retries` |
+| Backoff | Exponential | Exponential with jitter |
+| Retryable status codes | 408, 429, 5xx (transient) | 408, 429, 500–504 |
+| Retryable connection errors | Yes | Yes (when `retry_safe: true`) |
+| Double-retry risk | N/A | Set `retry: false` to disable Req's built-in retry |
+
+<Warning>
+When using HTTPower, set `retry: false` in your client options to disable Req's built-in retry and avoid requests being retried twice.
+</Warning>
+
+### Req options pass-through
+
+HTTPower passes most Req options through to the underlying Req call:
+
+```elixir
+HTTPower.get("https://api.example.com",
+  # HTTPower options
+  max_retries: 3,
+  circuit_breaker: [...],
+
+  # Req options (passed through)
+  connect_timeout: 15_000,
+  receive_timeout: 30_000,
+  decode_body: false
+)
+```
+
+### JSON encoding/decoding
+
+<Note>
+Unlike `Req.post!(url, json: params)`, HTTPower does not automatically encode or decode JSON. Use Jason explicitly.
+</Note>
+
+```elixir
+# Encode request body
+HTTPower.post(url,
+  body: Jason.encode!(params),
+  headers: %{"content-type" => "application/json"}
+)
+
+# Decode response body
+{:ok, response} = HTTPower.get(url)
+data = Jason.decode!(response.body)
+```
+
+### Req.Request structs
+
+HTTPower does not use `Req.Request` structs directly. Use HTTPower's client pattern with `HTTPower.new/1` instead of building `Req.Request` structs manually.
+
+## Migration patterns
+
+### Pattern 1: Gradual module-by-module
+
+Migrate one module at a time while keeping others on Req:
+
+```elixir
+# Still using Req (internal, low-risk)
+defmodule MyApp.InternalClient do
+  def fetch_config do
+    Req.get!("http://internal-config/settings")
+  end
+end
+
+# Migrated to HTTPower (external, high-risk)
+defmodule MyApp.ExternalApiClient do
+  def fetch_data do
+    HTTPower.get("https://external-api.com/data")
+  end
+end
+```
+
+### Pattern 2: Wrapper pattern
+
+Keep Req calls for non-critical paths and wrap critical paths with HTTPower:
+
+```elixir
+defmodule MyApp.PaymentClient do
+  # Critical payment calls use HTTPower
+  def charge_customer(amount) do
+    client = HTTPower.new(
+      base_url: "https://api.stripe.com",
+      circuit_breaker: [failure_threshold: 3]
+    )
+
+    HTTPower.post(client, "/v1/charges", body: encode_params(amount))
+  end
+
+  # Non-critical calls still use Req
+  def list_products do
+    Req.get!("https://api.stripe.com/v1/products")
+  end
+end
+```
+
+### Pattern 3: Feature flags
+
+Use feature flags for gradual rollout:
+
+```elixir
+defmodule MyApp.ApiClient do
+  def fetch_users do
+    if use_httpower?() do
+      HTTPower.get("https://api.example.com/users")
+    else
+      {:ok, Req.get!("https://api.example.com/users")}
+    end
+  end
+
+  defp use_httpower? do
+    Application.get_env(:myapp, :use_httpower, false)
+  end
+end
+```
+
+## Common scenarios
+
+### API client with retries
+
+```elixir
+defmodule MyApp.ApiClient do
+  def client do
+    HTTPower.new(
+      base_url: "https://api.example.com",
+      headers: %{"authorization" => "Bearer #{token()}"},
+      max_retries: 5,
+      timeout: 30
+    )
+  end
+
+  def fetch_data do
+    HTTPower.get(client(), "/data")
+  end
+end
+```
+
+### High-volume API with rate limiting
+
+```elixir
+config :httpower,
+  rate_limit: [
+    enabled: true,
+    requests: 1000,
+    per: :minute,
+    strategy: :wait,
+    max_wait_time: 5000
+  ]
+
+defmodule MyApp.HighVolumeClient do
+  def process_batch(items) do
+    Enum.map(items, fn item ->
+      HTTPower.post("https://api.example.com/process", body: item)
+    end)
+  end
+end
+```
+
+### Payment processing with circuit breaker
+
+```elixir
+config :httpower,
+  circuit_breaker: [
+    enabled: true,
+    failure_threshold: 3,
+    timeout: 30_000
+  ],
+  logging: [
+    enabled: true,
+    sanitize_body_fields: ["card_number", "cvv"]
+  ]
+
+defmodule MyApp.PaymentClient do
+  def charge(amount) do
+    case HTTPower.post("https://api.stripe.com/v1/charges", body: amount) do
+      {:ok, response}                          -> {:ok, response}
+      {:error, %{reason: :service_unavailable}} -> {:error, :service_unavailable}
+      {:error, error}                          -> {:error, error}
+    end
+  end
+end
+```
+
+## FAQ
+
+<AccordionGroup>
+  <Accordion title="Do I need to change all my Req calls at once?">
+    No. You can migrate gradually. HTTPower and Req can coexist in the same application.
+  </Accordion>
+
+  <Accordion title="Can I use Req-specific features?">
+    Most Req features work through pass-through options. Some Req-specific features (like plugins) may not be directly supported. Check the documentation or file an issue.
+  </Accordion>
+
+  <Accordion title="Should I disable Req's retry?">
+    Yes. Set `retry: false` when creating HTTPower clients to avoid double-retrying. HTTPower's retry logic is more configurable and includes jitter.
+  </Accordion>
+
+  <Accordion title="What about Req.Request structs?">
+    HTTPower does not use `Req.Request` structs directly. Use `HTTPower.new()` with client options instead.
+  </Accordion>
+
+  <Accordion title="Can I still use Req.new() options?">
+    Yes. Most `Req.new()` options work with `HTTPower.new()`. HTTPower internally uses Req, so options are passed through.
+  </Accordion>
+</AccordionGroup>
+
+## Troubleshooting
+
+### Double retrying
+
+**Symptom:** Requests are being retried more times than configured.
+
+**Solution:** Disable Req's built-in retry:
+
+```elixir
+HTTPower.new(
+  base_url: "https://api.example.com",
+  retry: false  # Disable Req's retry; HTTPower handles this
+)
+```
+
+### Test mode not blocking requests
+
+**Symptom:** Real HTTP requests happening in tests.
+
+**Solution:** Enable test mode in `test_helper.exs`:
+
+```elixir test/test_helper.exs
+Application.put_env(:httpower, :test_mode, true)
+```
+
+### JSON not automatically decoded
+
+**Symptom:** Response body is a raw string instead of a map.
+
+**Solution:** HTTPower does not automatically decode JSON. Decode the response body explicitly:
+
+```elixir
+{:ok, response} = HTTPower.get(url)
+data = Jason.decode!(response.body)
+```
+
+## Next steps
+
+- Read the [Configuration Reference](/configuration/overview) for all available options
+- Read the [Production Deployment](/guides/production-deployment) guide for production setup
+- Read the [Observability](/guides/observability) guide to set up telemetry and metrics

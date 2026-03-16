@@ -1,0 +1,146 @@
+---
+title: "HTTPower.Middleware.Dedup"
+description: "In-flight request deduplication that prevents duplicate side effects from concurrent identical requests."
+---
+
+`HTTPower.Middleware.Dedup` prevents duplicate requests from causing duplicate side effects — double charges, duplicate orders, repeated mutations — by tracking in-flight requests and sharing a single response with all concurrent identical requests.
+
+## How It Works
+
+1. **Fingerprinting** — Each request is hashed by `method + URL + body` using SHA-256.
+2. **First request executes** — Marked as `:in_flight` in ETS; proceeds through the normal pipeline.
+3. **Concurrent duplicates wait** — Identical requests arriving while the first is in-flight block in a `receive` until the first completes.
+4. **Response sharing** — When the first request finishes, all waiting processes receive the same response via message passing.
+5. **Brief cache window** — For 500 ms after completion, the response is cached to catch race conditions between the completion broadcast and new arrivals.
+6. **Automatic cleanup** — The ETS table is scanned every 5 seconds; completed entries older than 500 ms are removed.
+
+## States
+
+- **`:in_flight`** — A request is executing. Additional identical requests will wait. ETS entry format: `{hash, {:in_flight, [waiter_pids], owner_pid}, ref, timestamp}`.
+- **`:completed`** — The request finished. Entry is kept briefly (500 ms) to serve late arrivals. ETS entry format: `{hash, {:completed, response}, ref, timestamp}`.
+
+## Configuration
+
+```elixir
+# Global configuration
+config :httpower, :deduplicate,
+  enabled: true,
+  ttl: 5_000
+
+# Per-request
+HTTPower.post(url,
+  body: payment_data,
+  deduplicate: [
+    enabled: true,
+    ttl: 10_000,
+    wait_timeout: 60_000,
+    key: "custom-dedup-key"  # Override automatic hash generation
+  ]
+)
+```
+
+<AccordionGroup>
+  <Accordion title="Configuration options">
+    <ParamField path="enabled" type="boolean">
+      Enable or disable deduplication. Default: `false`.
+    </ParamField>
+    <ParamField path="ttl" type="pos_integer">
+      Milliseconds to track an in-flight request. If the executing request does not complete within this window, waiting requests receive a timeout error. Default: `5_000`.
+    </ParamField>
+    <ParamField path="wait_timeout" type="pos_integer">
+      Maximum milliseconds a waiting process will block for the in-flight request to complete. After this, the waiter receives `{:error, %HTTPower.Error{reason: :dedup_timeout}}`. Default: `30_000`.
+    </ParamField>
+    <ParamField path="key" type="String.t()">
+      Optional override for the automatic fingerprint hash. Use this when two requests that should be deduplicated have different bodies (e.g., include a timestamp) but represent the same logical operation.
+    </ParamField>
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Fingerprinting
+
+The default deduplication key is a SHA-256 hash of `method:url:body`:
+
+```elixir
+@spec hash(atom(), String.t(), String.t() | nil) :: String.t()
+def hash(method, url, body) do
+  content = "#{method}:#{url}:#{body || ""}"
+  :crypto.hash(:sha256, content) |> Base.encode16(case: :lower)
+end
+```
+
+The hash is a 64-character lowercase hex string. Two requests are considered identical if and only if their method, full URL (including query string), and body are identical.
+
+<Warning>
+Deduplication is disabled by default. Enable it explicitly for operations where duplicate side effects are unacceptable (payments, order creation, etc.). Do not enable it globally for read-only endpoints where fresh responses are expected.
+</Warning>
+
+---
+
+## Process Safety and Crash Handling
+
+The GenServer monitors both the executing process and all waiting processes:
+
+- **If the executing process crashes** — all waiting processes receive `{:dedup_error, ref, :requester_down}` and return an error.
+- **If a waiting process crashes** — it is removed from the waiter list silently; the executing request continues unaffected.
+
+Monitors are cleaned up eagerly when requests complete to avoid leaks.
+
+---
+
+## Telemetry Events
+
+| Event | Measurements | Metadata |
+|-------|-------------|----------|
+| `[:httpower, :dedup, :execute]` | `%{}` | `%{dedup_key: hash}` |
+| `[:httpower, :dedup, :wait]` | `%{wait_time_ms: integer, bypassed_rate_limit: 1}` | `%{dedup_key: hash, coordination: :rate_limit_bypass}` |
+| `[:httpower, :dedup, :cache_hit]` | `%{bypassed_rate_limit: 1}` | `%{dedup_key: hash, coordination: :rate_limit_bypass}` |
+| `[:httpower, :dedup, :abort]` | `%{waiter_count: integer}` | `%{dedup_key: hash, reason: atom}` |
+
+The `bypassed_rate_limit: 1` measurement on `:wait` and `:cache_hit` events signals that a token was not consumed from the rate limiter for this request, enabling accurate throughput accounting.
+
+---
+
+## Usage Examples
+
+```elixir
+# Prevent double charges — enable dedup on payment POST
+HTTPower.post("https://api.stripe.com/v1/charges",
+  body: %{amount: 2000, currency: "usd", source: "tok_visa"},
+  deduplicate: [enabled: true, ttl: 5_000]
+)
+
+# Global config for a payment processing client
+client = HTTPower.new(
+  base_url: "https://payment-gateway.com",
+  deduplicate: [enabled: true, ttl: 5_000]
+)
+
+# Custom dedup key — two requests with the same idempotency_key
+# represent the same operation regardless of body differences
+HTTPower.post(url,
+  body: Jason.encode!(order),
+  deduplicate: [
+    enabled: true,
+    key: idempotency_key
+  ]
+)
+```
+
+```elixir
+# Concurrent requests — only one HTTP call is made
+tasks =
+  for _ <- 1..10 do
+    Task.async(fn ->
+      HTTPower.post("https://api.example.com/order",
+        body: ~s({"item": "widget"}),
+        deduplicate: [enabled: true]
+      )
+    end)
+  end
+
+# All 10 tasks receive the same response from a single HTTP request
+results = Task.await_many(tasks)
+# => [{:ok, %HTTPower.Response{...}}, {:ok, %HTTPower.Response{...}}, ...]
+```

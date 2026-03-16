@@ -1,0 +1,191 @@
+---
+title: "HTTPower.Client"
+description: "Internal dispatch module that runs the middleware pipeline and executes HTTP requests."
+---
+
+`HTTPower.Client` is the internal layer that sits between the public `HTTPower` API and the adapter system. When you call `HTTPower.get/2`, it delegates immediately to `HTTPower.Client.get/2`, which:
+
+1. Validates the URL
+2. Checks test mode
+3. Builds the middleware pipeline
+4. Runs the request through each middleware step
+5. Executes the HTTP call via the selected adapter with retry logic
+6. Emits telemetry events
+7. Returns `{:ok, Response.t()}` or `{:error, Error.t()}`
+
+<Note>
+  `HTTPower.Client` is an internal module. Most applications interact exclusively with the top-level `HTTPower` module. The information here is relevant when building custom middleware, writing adapter integrations, or understanding how requests flow through the system.
+</Note>
+
+---
+
+## Struct
+
+The public-facing client struct is defined on `HTTPower` (not on this module), but represents the same concept:
+
+```elixir
+# Defined in HTTPower (httpower.ex)
+@type client :: %HTTPower{
+  base_url: String.t() | nil,
+  options: keyword()
+}
+
+defstruct base_url: nil, options: []
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `base_url` | `String.t() \| nil` | `nil` | Prepended to every path argument passed to an HTTP method. |
+| `options` | `keyword()` | `[]` | Default request options applied to every request made with this client. |
+
+```elixir
+# Create a client via HTTPower.new/1
+client = HTTPower.new(
+  base_url: "https://api.example.com",
+  headers: %{"Authorization" => "Bearer token"},
+  timeout: 30
+)
+
+# The struct looks like:
+# %HTTPower{base_url: "https://api.example.com", options: [headers: %{...}, timeout: 30]}
+```
+
+---
+
+## Adapter System
+
+`HTTPower.Client` selects the HTTP adapter at compile time (for performance) and per-request at runtime (for flexibility). Adapters are resolved in this order:
+
+1. **Per-request `:adapter` option** — highest precedence
+2. **Application config** `Application.compile_env(:httpower, :adapter, nil)` — compiled in
+3. **Auto-detection** — scans for available adapter modules at startup
+
+### Auto-detection order
+
+```elixir
+# HTTPower.Client detects adapters in this priority:
+# 1. HTTPower.Adapter.Finch  (high-performance, Mint-based — recommended)
+# 2. HTTPower.Adapter.Req    (batteries-included)
+# 3. HTTPower.Adapter.Tesla  (bring-your-own-config)
+```
+
+Add exactly one adapter to your `mix.exs` dependencies:
+
+```elixir
+# mix.exs
+def deps do
+  [
+    {:httpower, "~> x.x"},
+
+    # Pick one:
+    {:finch, "~> 0.20"},   # recommended
+    # {:req, "~> 0.4.0"},
+    # {:tesla, "~> 1.11"}
+  ]
+end
+```
+
+To specify an adapter explicitly at the application level:
+
+```elixir
+# config/config.exs
+config :httpower, adapter: HTTPower.Adapter.Finch
+```
+
+To override per-request:
+
+```elixir
+HTTPower.get("https://api.example.com/data", adapter: HTTPower.Adapter.Req)
+```
+
+---
+
+## Middleware Pipeline
+
+The pipeline is built at compile time from application config and extended at runtime via per-request options. Middleware runs in this order:
+
+| Order | Module | Config key | Purpose |
+|---|---|---|---|
+| 1 | `HTTPower.Middleware.Dedup` | `:deduplicate` | Cache hits bypass rate limiting — must run first |
+| 2 | `HTTPower.Middleware.RateLimiter` | `:rate_limit` | Rate-limit failures should not open the circuit breaker |
+| 3 | `HTTPower.Middleware.CircuitBreaker` | `:circuit_breaker` | Protects the actual HTTP call |
+
+All middleware is **enabled by default** unless explicitly disabled in application config:
+
+```elixir
+# config/config.exs — disable specific middleware
+config :httpower, :circuit_breaker, enabled: false
+config :httpower, :rate_limit, enabled: false
+```
+
+Override per-request:
+
+```elixir
+# Disable rate limiting for a single request
+HTTPower.get("https://api.example.com/data", rate_limit: false)
+
+# Enable with custom config per-request
+HTTPower.get("https://api.example.com/data", rate_limit: [requests: 500])
+```
+
+<Note>
+  Compile-time configuration is cached via `Application.compile_env/3` for performance. Changes to `:httpower` application config require recompilation of `HTTPower.Client`. Runtime options passed per-request always take effect without recompilation.
+</Note>
+
+---
+
+## Test Mode
+
+When `Application.get_env(:httpower, :test_mode)` is `true`, all requests are blocked unless one of the following is true:
+
+- The request includes a `:plug` option (e.g., `plug: {Req.Test, MyApp}`)
+- `HTTPower.Test.mock_enabled?/0` returns `true`
+- The `:adapter` option is a `{module, config}` tuple (explicit adapter with config)
+
+Blocked requests return immediately without touching the network:
+
+```elixir
+{:error, %HTTPower.Error{reason: :network_blocked, message: "Network access blocked in test mode"}}
+```
+
+---
+
+## Client Creation Pattern
+
+The recommended pattern for building API clients on top of HTTPower:
+
+```elixir
+defmodule MyApp.ApiClient do
+  @base_url "https://api.example.com"
+
+  defp client do
+    HTTPower.new(
+      base_url: @base_url,
+      headers: %{
+        "Authorization" => "Bearer #{api_key()}",
+        "Content-Type" => "application/json"
+      },
+      timeout: 30,
+      max_retries: 3
+    )
+  end
+
+  def list_users do
+    case HTTPower.get(client(), "/users") do
+      {:ok, %{status: 200, body: body}} -> {:ok, body}
+      {:ok, %{status: status}} -> {:error, {:http, status}}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  def create_user(attrs) do
+    case HTTPower.post(client(), "/users", body: Jason.encode!(attrs)) do
+      {:ok, %{status: 201, body: body}} -> {:ok, body}
+      {:ok, %{status: status}} -> {:error, {:http, status}}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  defp api_key, do: Application.fetch_env!(:my_app, :api_key)
+end
+```

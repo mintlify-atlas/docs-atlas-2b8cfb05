@@ -1,0 +1,213 @@
+---
+title: "HTTPower.Profiles"
+description: "Pre-configured middleware settings for payment processing, high-volume APIs, and microservices."
+---
+
+`HTTPower.Profiles` provides named sets of middleware configuration that encode best practices for common deployment scenarios. Apply a profile when creating a client and all the middleware — rate limiting, circuit breaking, deduplication, and retry — is configured with sensible defaults for that use case.
+
+Explicit options passed to `HTTPower.new/1` always win over profile settings.
+
+## Usage
+
+```elixir
+# Apply a profile
+client = HTTPower.new(
+  base_url: "https://payment-gateway.com",
+  profile: :payment_processing
+)
+
+# Override a single profile setting
+client = HTTPower.new(
+  base_url: "https://api.example.com",
+  profile: :high_volume_api,
+  rate_limit: [requests: 2000]  # override profile's 1000 req/min
+)
+```
+
+---
+
+## Public Functions
+
+### `list/0`
+
+Returns all available profile names.
+
+```elixir
+@spec list() :: [atom()]
+```
+
+```elixir
+HTTPower.Profiles.list()
+# => [:payment_processing, :high_volume_api, :microservices_mesh]
+```
+
+---
+
+### `get/1`
+
+Looks up a profile by name and returns its configuration keyword list.
+
+```elixir
+@spec get(atom()) :: {:ok, keyword()} | {:error, :unknown_profile}
+```
+
+<ParamField path="name" type="atom()" required>
+  Profile name. One of `:payment_processing`, `:high_volume_api`, `:microservices_mesh`.
+</ParamField>
+
+```elixir
+{:ok, config} = HTTPower.Profiles.get(:payment_processing)
+
+HTTPower.Profiles.get(:nonexistent)
+# => {:error, :unknown_profile}
+```
+
+---
+
+### `payment_processing/0`
+
+Configuration optimized for payment gateways (Stripe, PayPal, Adyen, etc.) where **correctness is more important than speed**. Deduplication is enabled to prevent double charges.
+
+```elixir
+@spec payment_processing() :: keyword()
+```
+
+**Returns:**
+
+```elixir
+[
+  rate_limit: [
+    enabled: true,
+    requests: 100,
+    per: :minute,
+    strategy: :wait,
+    max_wait_time: 5000,
+    adaptive: true
+  ],
+  circuit_breaker: [
+    enabled: true,
+    failure_threshold: 6,
+    failure_threshold_percentage: 30.0,
+    window_size: 20,
+    timeout: 30_000,
+    half_open_requests: 3
+  ],
+  deduplicate: [
+    enabled: true,
+    ttl: 5_000
+  ],
+  max_retries: 3,
+  base_delay: 2_000,
+  max_delay: 30_000
+]
+```
+
+<AccordionGroup>
+  <Accordion title="Design rationale">
+    - **Rate limit: 100 req/min** — conservative to stay well within typical payment API limits.
+    - **Circuit breaker: 30% failure threshold** — aggressive; payment APIs must be reliable.
+    - **Circuit breaker timeout: 30s** — longer recovery window appropriate for slow payment APIs.
+    - **Deduplication: 5s TTL** — 5-second window to catch double-clicks and retry storms.
+    - **Retry: 3 attempts, 2s base delay** — patient retries since payment APIs can be slow.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+### `high_volume_api/0`
+
+Configuration optimized for high-throughput scenarios (public APIs, content APIs, high-traffic internal services) where **throughput is more important than individual request latency**.
+
+```elixir
+@spec high_volume_api() :: keyword()
+```
+
+**Returns:**
+
+```elixir
+[
+  rate_limit: [
+    enabled: true,
+    requests: 1000,
+    per: :minute,
+    strategy: :wait,
+    max_wait_time: 5000,
+    adaptive: true
+  ],
+  circuit_breaker: [
+    enabled: true,
+    failure_threshold: 50,
+    failure_threshold_percentage: 50.0,
+    window_size: 100,
+    timeout: 5_000,
+    half_open_requests: 10
+  ],
+  deduplicate: [
+    enabled: true,
+    ttl: 1_000
+  ],
+  max_retries: 2,
+  base_delay: 500,
+  max_delay: 10_000
+]
+```
+
+<AccordionGroup>
+  <Accordion title="Design rationale">
+    - **Rate limit: 1000 req/min** — high throughput for APIs that support it.
+    - **Circuit breaker: 50% failure threshold over 100 requests** — tolerant of transient failures at high volume.
+    - **Circuit breaker timeout: 5s** — fast recovery; don’t wait long to probe a recovering service.
+    - **Deduplication: 1s TTL** — short window for response sharing across concurrent identical reads.
+    - **Retry: 2 attempts, 500ms base delay** — fewer, faster retries to maximize throughput.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+### `microservices_mesh/0`
+
+Configuration optimized for service-to-service communication inside a microservices architecture or Kubernetes cluster, where **preventing cascade failures is the top priority**.
+
+```elixir
+@spec microservices_mesh() :: keyword()
+```
+
+**Returns:**
+
+```elixir
+[
+  rate_limit: [
+    enabled: true,
+    requests: 500,
+    per: :minute,
+    strategy: :wait,
+    max_wait_time: 5000,
+    adaptive: true
+  ],
+  circuit_breaker: [
+    enabled: true,
+    failure_threshold: 20,
+    failure_threshold_percentage: 40.0,
+    window_size: 50,
+    timeout: 10_000,
+    half_open_requests: 5
+  ],
+  deduplicate: [
+    enabled: true,
+    ttl: 2_000
+  ],
+  max_retries: 3,
+  base_delay: 1_000,
+  max_delay: 20_000
+]
+```
+
+<AccordionGroup>
+  <Accordion title="Design rationale">
+    - **Rate limit: 500 req/min** — moderate; services typically communicate at controlled rates.
+    - **Circuit breaker: 40% threshold over 50 requests** — balanced for mesh environments where partial failures are common.
+    - **Circuit breaker timeout: 10s** — balanced recovery for services that restart quickly in Kubernetes.
+    - **Deduplication: 2s TTL** — critical for stopping retry storms from propagating across service boundaries.
+    - **Retry: 3 attempts, 1s base delay** — standard retry behavior for resilient inter-service calls.
+  </Accordion>
+</AccordionGroup>

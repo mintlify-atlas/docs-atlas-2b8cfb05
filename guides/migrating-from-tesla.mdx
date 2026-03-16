@@ -1,0 +1,521 @@
+---
+title: 'Migrating from Tesla'
+description: 'Add HTTPower reliability features to your existing Tesla-based application without rewriting your code.'
+keywords: ['tesla', 'migration', 'circuit breaker', 'rate limiting', 'middleware']
+---
+
+This guide shows you how to add HTTPower to your existing Tesla-based application without rewriting your code.
+
+HTTPower provides circuit breaker, rate limiting, PCI-compliant logging, and smart retries on top of your Tesla setup. Your existing Tesla middleware continues to work — HTTPower wraps Tesla rather than replacing it.
+
+<Note>
+Your existing Tesla middleware, plugs, and adapters keep working throughout this migration. HTTPower wraps Tesla — it does not replace it.
+</Note>
+
+## Prerequisites
+
+- Existing Elixir application using Tesla
+- Tesla `~> 1.11` or higher
+
+## Migration steps
+
+<Steps>
+  <Step title="Add HTTPower dependency">
+
+Update your `mix.exs`:
+
+```elixir mix.exs
+def deps do
+  [
+    {:tesla, "~> 1.11"},        # Your existing Tesla dependency
+    {:httpower, "~> 0.5.0"}     # Add HTTPower
+  ]
+end
+```
+
+Run `mix deps.get`.
+
+  </Step>
+  <Step title="Keep your existing Tesla client">
+
+Do not change your Tesla code. Your existing client works as-is. The only addition is a `client/0` function to expose your Tesla client to HTTPower:
+
+<CodeGroup>
+```elixir Before
+defmodule MyApp.ApiClient do
+  use Tesla
+
+  plug Tesla.Middleware.BaseURL, "https://api.example.com"
+  plug Tesla.Middleware.JSON
+  plug Tesla.Middleware.Headers, [{"user-agent", "MyApp/1.0"}]
+  plug Tesla.Middleware.Timeout, timeout: 30_000
+  plug Tesla.Middleware.Compression, format: "gzip"
+
+  def get_users do
+    get("/users")
+  end
+end
+```
+
+```elixir After
+defmodule MyApp.ApiClient do
+  use Tesla
+
+  plug Tesla.Middleware.BaseURL, "https://api.example.com"
+  plug Tesla.Middleware.JSON
+  plug Tesla.Middleware.Headers, [{"user-agent", "MyApp/1.0"}]
+  plug Tesla.Middleware.Timeout, timeout: 30_000
+  plug Tesla.Middleware.Compression, format: "gzip"
+
+  # Add this to expose the client to HTTPower
+  def client do
+    Tesla.client([])
+  end
+
+  def get_users do
+    get("/users")
+  end
+end
+```
+</CodeGroup>
+
+  </Step>
+  <Step title="Wrap with HTTPower (gradual migration)">
+
+Create HTTPower wrappers for the endpoints you want to protect. You can do this one endpoint at a time:
+
+```elixir
+defmodule MyApp.Users do
+  @doc "Fetch users with HTTPower reliability patterns"
+  def list_users do
+    client = HTTPower.new(
+      adapter: {HTTPower.Adapter.Tesla, MyApp.ApiClient.client()},
+      circuit_breaker: [
+        failure_threshold: 5,
+        timeout: 60_000
+      ],
+      rate_limit: [
+        requests: 100,
+        per: :minute
+      ]
+    )
+
+    HTTPower.get(client, "/users")
+  end
+end
+```
+
+Your Tesla middleware still runs — HTTPower calls Tesla, which executes all your plugs (BaseURL, JSON, Headers, etc.).
+
+  </Step>
+  <Step title="Configure global settings">
+
+Instead of passing options on every `HTTPower.new/1` call, configure globally in `config/config.exs`:
+
+```elixir config/config.exs
+config :httpower,
+  circuit_breaker: [
+    enabled: true,
+    failure_threshold: 5,
+    window_size: 10,
+    timeout: 60_000,
+    half_open_requests: 1
+  ],
+
+  rate_limit: [
+    enabled: true,
+    requests: 100,
+    per: :minute,
+    strategy: :wait,
+    max_wait_time: 5000
+  ],
+
+  logging: [
+    enabled: true,
+    level: :info,
+    sanitize_headers: ["authorization", "api-key"],
+    sanitize_body_fields: ["credit_card", "cvv", "password"]
+  ]
+```
+
+Your client code becomes simpler:
+
+```elixir
+defmodule MyApp.Users do
+  def list_users do
+    client = HTTPower.new(
+      adapter: {HTTPower.Adapter.Tesla, MyApp.ApiClient.client()}
+    )
+
+    HTTPower.get(client, "/users")
+  end
+end
+```
+
+  </Step>
+  <Step title="Make code adapter-agnostic (recommended)">
+
+Encapsulate the adapter configuration so your application code is completely independent of Tesla. This allows you to swap adapters later by changing one line of config:
+
+<CodeGroup>
+```elixir Before (adapter visible)
+defmodule MyApp.ApiClient do
+  def list_users do
+    client = HTTPower.new(
+      adapter: {HTTPower.Adapter.Tesla, MyApp.TeslaClient.client()},  # Tesla-specific
+      base_url: "https://api.example.com"
+    )
+    HTTPower.get(client, "/users")
+  end
+end
+```
+
+```elixir After (adapter hidden)
+defmodule MyApp.ApiClient do
+  def list_users do
+    HTTPower.get(client(), "/users")
+  end
+
+  def create_user(params) do
+    body = Jason.encode!(params)
+    HTTPower.post(client(), "/users",
+      body: body,
+      headers: %{"content-type" => "application/json"}
+    )
+  end
+
+  defp client do
+    HTTPower.new(
+      base_url: "https://api.example.com",
+      headers: %{"authorization" => "Bearer #{api_key()}"}
+      # Adapter configured globally in config.exs
+    )
+  end
+
+  defp api_key, do: Application.fetch_env!(:myapp, :api_key)
+end
+```
+</CodeGroup>
+
+**Option A: Configure adapter globally in `config.exs`**
+
+```elixir config/config.exs
+config :httpower, adapter: {HTTPower.Adapter.Tesla, MyApp.TeslaClient.client()}
+```
+
+With this approach, switching from Tesla to Req requires only a single config change — no code changes.
+
+**Option B: Configure adapter per-client**
+
+```elixir
+defp client do
+  HTTPower.new(
+    adapter: {HTTPower.Adapter.Tesla, MyApp.TeslaClient.client()},
+    base_url: "https://api.example.com",
+    headers: %{"authorization" => "Bearer #{api_key()}"}
+  )
+end
+```
+
+  </Step>
+  <Step title="Update tests to use HTTPower.Test">
+
+Replace `Tesla.Mock` with `HTTPower.Test` for adapter-independent testing:
+
+<CodeGroup>
+```elixir Before (Tesla.Mock)
+test "fetches users" do
+  Tesla.Mock.mock(fn
+    %{method: :get, url: "/users"} ->
+      {:ok, %Tesla.Env{status: 200, body: %{"users" => []}}}
+  end)
+
+  assert {:ok, _} = MyApp.ApiClient.get_users()
+end
+```
+
+```elixir After (HTTPower.Test)
+# In test_helper.exs
+Application.put_env(:httpower, :test_mode, true)
+
+# In your tests
+test "fetches users" do
+  HTTPower.Test.stub(fn conn ->
+    Plug.Conn.resp(conn, 200, Jason.encode!(%{"users" => []}))
+  end)
+
+  assert {:ok, %{status: 200}} = MyApp.ApiClient.list_users()
+end
+
+test "creates user" do
+  HTTPower.Test.stub(fn conn ->
+    Plug.Conn.resp(conn, 201, Jason.encode!(%{"id" => 1}))
+  end)
+
+  assert {:ok, %{status: 201}} = MyApp.ApiClient.create_user(%{name: "John"})
+end
+```
+</CodeGroup>
+
+`HTTPower.Test` works with any adapter, so your tests remain valid even if you later switch from Tesla to Req.
+
+  </Step>
+</Steps>
+
+## Final result
+
+After completing the migration, your client module is clean and adapter-agnostic:
+
+```elixir
+defmodule MyApp.ApiClient do
+  def list_users do
+    HTTPower.get(client(), "/users")
+  end
+
+  def create_user(params) do
+    HTTPower.post(client(), "/users",
+      body: Jason.encode!(params),
+      headers: %{"content-type" => "application/json"}
+    )
+  end
+
+  defp client do
+    HTTPower.new(
+      base_url: "https://api.example.com",
+      headers: %{"authorization" => "Bearer #{api_key()}"}
+      # Circuit breaker, rate limiting configured globally in config.exs
+      # Adapter can be swapped without code changes
+    )
+  end
+
+  defp api_key, do: Application.fetch_env!(:myapp, :api_key)
+end
+```
+
+**Benefits of this final state:**
+- No Tesla-specific code visible in application code
+- Can switch to Req adapter by changing one line of config
+- Tests use `HTTPower.Test` (adapter-agnostic)
+- All Tesla middleware still runs behind the scenes
+
+## Migration patterns
+
+### Pattern 1: Wrapper module (recommended)
+
+Keep the Tesla client internal and expose an HTTPower wrapper:
+
+```elixir
+defmodule MyApp.StripeClient do
+  @tesla_client MyApp.TeslaClients.Stripe.client()
+
+  defp httpower_client do
+    HTTPower.new(
+      adapter: {HTTPower.Adapter.Tesla, @tesla_client},
+      circuit_breaker: [failure_threshold: 3],
+      rate_limit: [requests: 100, per: :second]
+    )
+  end
+
+  def create_charge(params) do
+    HTTPower.post(httpower_client(), "/v1/charges", body: params)
+  end
+
+  def get_customer(id) do
+    HTTPower.get(httpower_client(), "/v1/customers/#{id}")
+  end
+end
+```
+
+### Pattern 2: Drop-in replacement
+
+Replace Tesla calls directly inside the existing module:
+
+<CodeGroup>
+```elixir Before
+defmodule MyApp.ApiClient do
+  use Tesla
+  plug Tesla.Middleware.BaseURL, "https://api.example.com"
+
+  def fetch_data do
+    get("/data")
+  end
+end
+```
+
+```elixir After
+defmodule MyApp.ApiClient do
+  use Tesla
+  plug Tesla.Middleware.BaseURL, "https://api.example.com"
+
+  def client, do: Tesla.client([])
+
+  defp httpower, do: HTTPower.new(adapter: {HTTPower.Adapter.Tesla, client()})
+
+  def fetch_data do
+    HTTPower.get(httpower(), "/data")
+  end
+end
+```
+</CodeGroup>
+
+### Pattern 3: Gradual migration
+
+Migrate one critical endpoint at a time while keeping others on plain Tesla:
+
+```elixir
+defmodule MyApp.PaymentClient do
+  use Tesla
+  plug Tesla.Middleware.BaseURL, "https://api.stripe.com"
+
+  def client, do: Tesla.client([])
+
+  # Critical endpoint — migrated to HTTPower
+  def create_charge(params) do
+    client = HTTPower.new(adapter: {HTTPower.Adapter.Tesla, client()})
+    HTTPower.post(client, "/v1/charges", body: params)
+  end
+
+  # Non-critical endpoint — still using plain Tesla
+  def list_customers do
+    get("/v1/customers")
+  end
+end
+```
+
+## Common scenarios
+
+### Payment processing (Stripe, PayPal, etc.)
+
+```elixir
+config :httpower,
+  circuit_breaker: [
+    enabled: true,
+    failure_threshold: 3,      # Open circuit after 3 failures
+    timeout: 30_000            # Try again after 30 seconds
+  ],
+  rate_limit: [
+    enabled: true,
+    requests: 100,
+    per: :second,
+    strategy: :error           # Return error instead of waiting
+  ],
+  logging: [
+    enabled: true,
+    sanitize_body_fields: ["card_number", "cvv", "card_cvc"]
+  ]
+```
+
+### High-volume API integration
+
+```elixir
+config :httpower,
+  circuit_breaker: [
+    enabled: true,
+    failure_threshold_percentage: 50,  # Open at 50% failure rate
+    window_size: 100                    # Track last 100 requests
+  ],
+  rate_limit: [
+    enabled: true,
+    requests: 1000,
+    per: :minute,
+    strategy: :wait,
+    max_wait_time: 10_000
+  ]
+```
+
+### Microservice communication
+
+Use `circuit_breaker_key` to isolate circuit state per service:
+
+```elixir
+defmodule MyApp.UserService do
+  def client do
+    HTTPower.new(
+      adapter: {HTTPower.Adapter.Tesla, MyApp.Tesla.UserService.client()},
+      circuit_breaker: [failure_threshold: 5, timeout: 60_000],
+      circuit_breaker_key: "user_service"
+    )
+  end
+end
+
+defmodule MyApp.OrderService do
+  def client do
+    HTTPower.new(
+      adapter: {HTTPower.Adapter.Tesla, MyApp.Tesla.OrderService.client()},
+      circuit_breaker: [failure_threshold: 3, timeout: 30_000],
+      circuit_breaker_key: "order_service"
+    )
+  end
+end
+```
+
+## FAQ
+
+<AccordionGroup>
+  <Accordion title="Do I need to rewrite my Tesla middleware?">
+    No. Your Tesla middleware continues to work. HTTPower wraps Tesla, so all your plugs run normally.
+  </Accordion>
+
+  <Accordion title="Can I use Tesla's built-in retry?">
+    Not recommended. Disable `Tesla.Middleware.Retry` to avoid double-retrying. HTTPower's retry logic includes exponential backoff and jitter.
+  </Accordion>
+
+  <Accordion title="What happens to Tesla.Middleware.Timeout?">
+    Both work together. Tesla's timeout is the per-request timeout. HTTPower's `timeout` option does the same thing. If you set both, the lower value takes effect.
+  </Accordion>
+
+  <Accordion title="Can I migrate gradually?">
+    Yes. Migrate critical endpoints first (payments, auth), then gradually add others. Tesla and HTTPower can coexist in the same module.
+  </Accordion>
+
+  <Accordion title="Does this affect performance?">
+    HTTPower adds approximately 1–5 ms overhead for the reliability layer. The trade-off is worth it for production reliability (circuit breaker, rate limiting, retries).
+  </Accordion>
+
+  <Accordion title="Can I see the circuit breaker state?">
+```elixir
+HTTPower.Middleware.CircuitBreaker.get_state("my_api")
+# Returns: :closed | :open | :half_open | nil
+```
+  </Accordion>
+</AccordionGroup>
+
+## Troubleshooting
+
+### Circuit breaker not opening
+
+**Symptom:** Service is failing but circuit stays closed.
+
+**Solutions:**
+1. Check that the circuit breaker is enabled: `config :httpower, circuit_breaker: [enabled: true]`
+2. Verify that the failure threshold is being reached
+3. Check circuit key — different keys have different independent circuits
+4. Add logging to inspect the state:
+   ```elixir
+   Logger.info("Circuit state: #{inspect(HTTPower.Middleware.CircuitBreaker.get_state("my_key"))}")
+   ```
+
+### Rate limiting too aggressive
+
+**Symptom:** Getting `:too_many_requests` errors unexpectedly.
+
+**Solutions:**
+1. Increase the limit: `rate_limit: [requests: 200, per: :minute]`
+2. Use `:wait` strategy instead of `:error`
+3. Use custom bucket keys to separate different endpoints
+4. Check whether multiple nodes are sharing the rate limiter (limits are per-node)
+
+### Tesla middleware not running
+
+**Symptom:** Headers or transformations from Tesla plugs are missing.
+
+**Solutions:**
+1. Make sure you're passing the Tesla client: `adapter: {HTTPower.Adapter.Tesla, MyApp.Client.client()}`
+2. Check that the `client()` function builds the Tesla client with middleware
+3. Verify Tesla middleware order — some plugs must come before others
+
+## Next steps
+
+- Read the [Configuration Reference](/configuration/overview) for all available options
+- Read the [Production Deployment](/guides/production-deployment) guide for production setup
+- Review the [Observability](/guides/observability) guide to set up telemetry

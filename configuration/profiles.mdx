@@ -1,0 +1,265 @@
+---
+title: 'Configuration Profiles'
+description: 'Use pre-built HTTPower profiles to apply production-ready defaults for payment processing, high-volume APIs, and microservices without manual tuning.'
+keywords: ['profiles', 'payment processing', 'high volume', 'microservices', 'configuration']
+---
+
+Profiles are named sets of configuration values that encode best practices for common deployment scenarios. Instead of manually tuning rate limits, circuit breaker thresholds, retry delays, and deduplication windows, you pick a profile that matches your use case and get well-tested defaults immediately.
+
+Profile settings are merged with any explicit options you provide. **Explicit options always override profile defaults**, so you can adopt a profile and still fine-tune individual values.
+
+```elixir
+# Use a profile
+client = HTTPower.new(
+  base_url: "https://payment-gateway.com",
+  profile: :payment_processing
+)
+
+# Use a profile and override one setting
+client = HTTPower.new(
+  base_url: "https://api.example.com",
+  profile: :high_volume_api,
+  rate_limit: [requests: 2000]  # Override profile's 1000 req/min
+)
+```
+
+## Available profiles
+
+<Columns cols={3}>
+  <Card title=":payment_processing" icon="shield-check">
+    Conservative settings for payment gateways. Prioritises correctness over speed. Prevents double charges with 5-second deduplication.
+  </Card>
+  <Card title=":high_volume_api" icon="bolt">
+    High-throughput settings for public APIs and content services. Maximises request volume with fast circuit recovery and short dedup windows.
+  </Card>
+  <Card title=":microservices_mesh" icon="network-wired">
+    Balanced settings for service-to-service calls in Kubernetes or a service mesh. Prevents cascade failures and retry storms.
+  </Card>
+</Columns>
+
+## Profile details
+
+<Tabs>
+  <Tab title=":payment_processing">
+    **Use case:** Stripe, PayPal, payment gateways, financial APIs
+
+    **Priority:** Correctness over speed
+
+    This profile uses an aggressive circuit breaker that opens at 30% failure rate — before most profiles would react. Deduplication with a 5-second TTL prevents the same payment request from being sent twice even if the client retries. Rate limiting is conservative to avoid gateway throttling, and retry delays are long because payment APIs are often slow to recover.
+
+    ```elixir
+    # What :payment_processing expands to
+    [
+      rate_limit: [
+        enabled: true,
+        requests: 100,
+        per: :minute,
+        strategy: :wait,
+        max_wait_time: 5000,
+        adaptive: true
+      ],
+      circuit_breaker: [
+        enabled: true,
+        failure_threshold: 6,
+        failure_threshold_percentage: 30.0,
+        window_size: 20,
+        timeout: 30_000,
+        half_open_requests: 3
+      ],
+      deduplicate: [
+        enabled: true,
+        ttl: 5_000
+      ],
+      max_retries: 3,
+      base_delay: 2_000,
+      max_delay: 30_000
+    ]
+    ```
+
+    **Key settings explained:**
+    - `failure_threshold_percentage: 30.0` — circuit opens when 30% of the last 20 requests fail, not just when an absolute count is reached
+    - `deduplicate: [ttl: 5_000]` — identical requests within 5 seconds return a cached response rather than hitting the gateway again
+    - `base_delay: 2_000` — retries start at 2 seconds, giving payment systems time to recover
+    - `adaptive: true` — rate limit automatically reduces when the circuit breaker signals the service is struggling
+
+    ```elixir
+    # Full usage example
+    payment_client = HTTPower.new(
+      base_url: "https://api.stripe.com",
+      headers: %{"authorization" => "Bearer #{stripe_key}"},
+      profile: :payment_processing
+    )
+
+    case HTTPower.post(payment_client, "/v1/charges", body: charge_params) do
+      {:ok, %{status: 200} = response} -> {:ok, response.body}
+      {:ok, %{status: status} = response} -> {:error, {status, response.body}}
+      {:error, error} -> {:error, error}
+    end
+    ```
+  </Tab>
+  <Tab title=":high_volume_api">
+    **Use case:** Public APIs, high-traffic internal services, content APIs
+
+    **Priority:** Throughput over latency
+
+    This profile is tuned for services that receive many requests. The circuit breaker tolerates a higher failure rate (50%) before opening, because some failures are expected at volume. Deduplication uses a short 1-second TTL to share responses across concurrent requests, which can provide a significant capacity boost when many callers ask for the same resource. Retries are fewer and faster to keep overall latency low.
+
+    ```elixir
+    # What :high_volume_api expands to
+    [
+      rate_limit: [
+        enabled: true,
+        requests: 1000,
+        per: :minute,
+        strategy: :wait,
+        max_wait_time: 5000,
+        adaptive: true
+      ],
+      circuit_breaker: [
+        enabled: true,
+        failure_threshold: 50,
+        failure_threshold_percentage: 50.0,
+        window_size: 100,
+        timeout: 5_000,
+        half_open_requests: 10
+      ],
+      deduplicate: [
+        enabled: true,
+        ttl: 1_000
+      ],
+      max_retries: 2,
+      base_delay: 500,
+      max_delay: 10_000
+    ]
+    ```
+
+    **Key settings explained:**
+    - `requests: 1000` — allows up to 1000 requests per minute before rate limiting
+    - `window_size: 100` — tracks the last 100 requests for circuit breaker health, giving a statistically meaningful sample
+    - `timeout: 5_000` — circuit recovers after 5 seconds, enabling fast failover at high volume
+    - `half_open_requests: 10` — allows 10 test requests in half-open state before fully closing the circuit
+    - `deduplicate: [ttl: 1_000]` — 1-second dedup window consolidates concurrent identical requests
+
+    ```elixir
+    # Full usage example
+    api_client = HTTPower.new(
+      base_url: "https://content-api.example.com",
+      profile: :high_volume_api
+    )
+
+    # Concurrent callers asking for the same article share one HTTP request
+    HTTPower.get(api_client, "/articles/#{id}")
+    ```
+  </Tab>
+  <Tab title=":microservices_mesh">
+    **Use case:** Service-to-service calls, internal microservices, Kubernetes
+
+    **Priority:** Reliability over individual request speed
+
+    This profile targets the inter-service communication pattern in a microservices architecture. The circuit breaker uses a 40% failure threshold — more sensitive than `:high_volume_api` but less aggressive than `:payment_processing`. Deduplication with a 2-second TTL is especially important here to prevent retry storms, where one failing service causes all its callers to retry simultaneously, amplifying the load.
+
+    ```elixir
+    # What :microservices_mesh expands to
+    [
+      rate_limit: [
+        enabled: true,
+        requests: 500,
+        per: :minute,
+        strategy: :wait,
+        max_wait_time: 5000,
+        adaptive: true
+      ],
+      circuit_breaker: [
+        enabled: true,
+        failure_threshold: 20,
+        failure_threshold_percentage: 40.0,
+        window_size: 50,
+        timeout: 10_000,
+        half_open_requests: 5
+      ],
+      deduplicate: [
+        enabled: true,
+        ttl: 2_000
+      ],
+      max_retries: 3,
+      base_delay: 1_000,
+      max_delay: 20_000
+    ]
+    ```
+
+    **Key settings explained:**
+    - `failure_threshold_percentage: 40.0` — opens circuit at 40% failure rate across the last 50 requests
+    - `timeout: 10_000` — 10-second open state gives the downstream service time to recover
+    - `deduplicate: [ttl: 2_000]` — 2-second window absorbs retry storms from multiple upstream callers
+    - `adaptive: true` — rate limit reduces automatically when the circuit breaker signals degradation
+
+    ```elixir
+    # Full usage example (e.g., in a Phoenix context)
+    user_service = HTTPower.new(
+      base_url: "http://user-service.default.svc.cluster.local",
+      profile: :microservices_mesh
+    )
+
+    inventory_service = HTTPower.new(
+      base_url: "http://inventory-service.default.svc.cluster.local",
+      profile: :microservices_mesh
+    )
+
+    HTTPower.get(user_service, "/users/#{id}")
+    HTTPower.get(inventory_service, "/items/#{sku}")
+    ```
+  </Tab>
+</Tabs>
+
+## Overriding profile settings
+
+Profile values are defaults. Any option you pass explicitly to `HTTPower.new/1` takes precedence. Nested keyword lists (like `rate_limit` and `circuit_breaker`) are deep-merged, so you only need to specify the keys you want to change:
+
+```elixir
+# Override just the request limit, keep all other profile settings
+client = HTTPower.new(
+  base_url: "https://api.example.com",
+  profile: :payment_processing,
+  rate_limit: [requests: 50]  # Use 50 req/min instead of 100
+)
+
+# Override the circuit breaker timeout only
+client = HTTPower.new(
+  base_url: "https://api.example.com",
+  profile: :microservices_mesh,
+  circuit_breaker: [timeout: 30_000]  # Use 30s instead of 10s
+)
+
+# Disable retries for a write-once operation
+client = HTTPower.new(
+  base_url: "https://payment-gateway.com",
+  profile: :payment_processing,
+  max_retries: 0
+)
+```
+
+## Programmatic access
+
+You can inspect profiles programmatically using `HTTPower.Profiles`:
+
+```elixir
+# Get the configuration for a profile
+{:ok, config} = HTTPower.Profiles.get(:payment_processing)
+# => {:ok, [rate_limit: [...], circuit_breaker: [...], ...]}
+
+# Handle an unknown profile
+{:error, :unknown_profile} = HTTPower.Profiles.get(:invalid)
+
+# List all available profile names
+HTTPower.Profiles.list()
+# => [:payment_processing, :high_volume_api, :microservices_mesh]
+```
+
+Passing an unknown profile name to `HTTPower.new/1` raises an `ArgumentError` at client construction time:
+
+```elixir
+# Raises ArgumentError immediately — fail fast at startup
+client = HTTPower.new(profile: :typo_in_name)
+# ** (ArgumentError) Unknown profile: :typo_in_name
+#    Available profiles: [:payment_processing, :high_volume_api, :microservices_mesh]
+```

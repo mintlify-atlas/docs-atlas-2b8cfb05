@@ -1,0 +1,211 @@
+---
+title: "HTTPower.Logger"
+description: "PCI-compliant HTTP request/response logging via telemetry with automatic sensitive data redaction."
+---
+
+`HTTPower.Logger` attaches to HTTPower's telemetry events and logs HTTP requests and responses with automatic sanitization of sensitive data. It is designed for PCI DSS compliance: credit card numbers, CVV codes, authorization tokens, passwords, and other sensitive fields are redacted before any log output.
+
+Logging is **opt-in** — no output is produced until you call `attach/0` or `attach/1`.
+
+## Features
+
+- Structured log metadata for querying in Datadog, Splunk, ELK, Loki, and similar systems
+- Correlation IDs that link request and response log lines (integrates with Phoenix's `request_id`)
+- Automatic Luhn-validated credit card number detection and redaction
+- CVV/CVC pattern detection and redaction
+- Configurable additional headers and body fields to sanitize
+- Request duration in milliseconds on every response log line
+
+---
+
+## Public Functions
+
+### `attach/0`
+
+Attaches the logger using configuration from `Application.get_env(:httpower, :logging, [])`.
+
+```elixir
+@spec attach(keyword()) :: :ok | {:error, :already_exists}
+```
+
+```elixir
+# In application.ex
+def start(_type, _args) do
+  HTTPower.Logger.attach()
+  # ...
+end
+```
+
+---
+
+### `attach/1`
+
+Attaches the logger with runtime options. Options are **merged** with the application config defaults; the options you pass take precedence.
+
+The `:sanitize_headers` and `:sanitize_body_fields` options are **additive**: they extend the built-in default lists rather than replacing them.
+
+```elixir
+@spec attach(keyword()) :: :ok | {:error, :already_exists}
+```
+
+<ParamField path="level" type=":debug | :info | :warning | :error">
+  Log level for request and response events. Exceptions are always logged at `:error`. Default: `:info`.
+</ParamField>
+
+<ParamField path="log_headers" type="boolean">
+  Include sanitized request and response headers in log output and Logger metadata. Default: `true`.
+</ParamField>
+
+<ParamField path="log_body" type="boolean">
+  Include sanitized request and response bodies in log output and Logger metadata. Bodies longer than 500 characters are truncated with `... (truncated)`. Default: `true`.
+</ParamField>
+
+<ParamField path="sanitize_headers" type="list of String.t()">
+  Additional header names to redact (case-insensitive). These are **added to** the default sanitization list; they do not replace it.
+</ParamField>
+
+<ParamField path="sanitize_body_fields" type="list of String.t()">
+  Additional JSON body field names to redact (case-insensitive). These are **added to** the default sanitization list.
+</ParamField>
+
+```elixir
+HTTPower.Logger.attach(
+  level: :debug,
+  log_headers: true,
+  log_body: false,
+  sanitize_headers: ["x-internal-token"],
+  sanitize_body_fields: ["account_number"]
+)
+```
+
+---
+
+### `detach/0`
+
+Removes the telemetry handler. No further log output is produced until `attach/0` or `attach/1` is called again.
+
+```elixir
+@spec detach() :: :ok | {:error, :not_found}
+```
+
+```elixir
+HTTPower.Logger.detach()
+```
+
+---
+
+## Default Sanitization Lists
+
+### Headers (always redacted)
+
+The following header names are redacted with `[REDACTED]` regardless of configuration. Matching is case-insensitive.
+
+```
+authorization, api-key, x-api-key, api_key, apikey,
+secret, token, x-auth-token, x-csrf-token, cookie, set-cookie
+```
+
+### Body Fields (always redacted)
+
+The following JSON body field names are redacted. Matching is case-insensitive and works for both string bodies (JSON pattern matching) and map bodies (key-based redaction).
+
+```
+password, passwd, pwd, secret, api_key, apikey, token,
+credit_card, creditcard, card_number, cardnumber,
+cvv, cvv2, cvc, pin, ssn, social_security
+```
+
+### Automatic Pattern Detection
+
+In addition to field-name-based redaction, the logger applies pattern matching to string bodies:
+
+- **Credit card numbers** — any 13–19 digit sequence (with optional spaces/dashes) that passes the [Luhn algorithm](https://en.wikipedia.org/wiki/Luhn_algorithm) is replaced with `[REDACTED]`.
+- **CVV codes** — 3–4 digit sequences following keywords like `cvv`, `cvc`, `cvv2`, or `security_code` are replaced with `[REDACTED]`.
+
+---
+
+## Telemetry Events Handled
+
+| Event | When fired |
+|-------|------------|
+| `[:httpower, :request, :start]` | Before the HTTP request is dispatched |
+| `[:httpower, :request, :stop]` | After a response is received |
+| `[:httpower, :request, :exception]` | If an exception occurs during the request |
+
+---
+
+## Structured Logger Metadata
+
+All log entries set structured metadata via `Logger.metadata/1` in addition to the human-readable log message. This enables rich querying in log aggregation systems.
+
+**Request metadata keys:**
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `httpower_correlation_id` | `String.t()` | Unique ID for the request (`req_` + 16 hex chars). Uses Phoenix's `request_id` if available. |
+| `httpower_event` | `:request` | Event type |
+| `httpower_method` | `atom()` | HTTP method |
+| `httpower_url` | `String.t()` | Request URL |
+| `httpower_headers` | `map()` | Sanitized request headers (only set when `log_headers: true`) |
+| `httpower_body` | `String.t()` | Sanitized request body, truncated to 500 chars (only set when `log_body: true`) |
+
+**Response metadata keys:**
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `httpower_correlation_id` | `String.t()` | Same ID as the corresponding request |
+| `httpower_event` | `:response` | Event type |
+| `httpower_status` | `integer()` | HTTP status code |
+| `httpower_duration_ms` | `integer()` | Request duration in milliseconds |
+| `httpower_response_headers` | `map()` | Sanitized response headers |
+| `httpower_response_body` | `String.t()` | Sanitized response body |
+
+**Exception metadata keys:**
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `httpower_correlation_id` | `String.t()` | Correlation ID |
+| `httpower_event` | `:exception` | Event type |
+| `httpower_duration_ms` | `integer()` | Time until exception |
+| `httpower_exception_kind` | `:error | :exit | :throw` | Exception kind |
+| `httpower_exception_reason` | `String.t()` | Inspected exception reason |
+
+---
+
+## Log Format
+
+```
+# Request
+[HTTPower] [req_a3f9b2c1d4e5f678] → POST https://api.stripe.com/v1/charges headers=%{...} body="..."
+
+# Response
+[HTTPower] [req_a3f9b2c1d4e5f678] ← 200 (142ms) headers=%{...} body=%{...}
+
+# Exception
+[HTTPower] [req_a3f9b2c1d4e5f678] EXCEPTION (31ms) error: :timeout
+```
+
+---
+
+## Application Config
+
+```elixir
+config :httpower, :logging,
+  level: :info,
+  log_headers: true,
+  log_body: true,
+  sanitize_headers: ["x-custom-secret"],
+  sanitize_body_fields: ["national_id"]
+```
+
+---
+
+## Phoenix Integration
+
+The logger automatically picks up Phoenix's `request_id` from `Logger.metadata()` and uses it as the `httpower_correlation_id`, linking HTTPower log lines to the Phoenix request trace:
+
+```elixir
+# In your Phoenix endpoint or application supervisor:
+HTTPower.Logger.attach()
+# No further configuration needed — correlation IDs are populated automatically.
+```

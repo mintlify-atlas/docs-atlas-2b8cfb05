@@ -1,0 +1,281 @@
+---
+title: 'Configuration Overview'
+description: 'Understand the three configuration levels in HTTPower and how they interact through precedence rules, header merging, and environment-specific settings.'
+keywords: ['configuration', 'global config', 'per-client', 'per-request', 'precedence']
+---
+
+HTTPower supports three levels of configuration that compose together at runtime. More specific configuration always overrides less specific configuration.
+
+<Note>
+**Precedence rule:** Per-Request > Per-Client > Global. A value set closer to the request always wins. The only exception is headers, which are merged across all three levels rather than replaced.
+</Note>
+
+## Configuration levels
+
+<Tabs>
+  <Tab title="Global (config.exs)">
+    Global configuration lives in your Mix config files and applies to every request made by HTTPower unless overridden. Set it with `config :httpower, ...`.
+
+    ```elixir
+    # config/config.exs
+    config :httpower,
+      # Adapter (auto-detects Req then Tesla if not specified)
+      adapter: HTTPower.Adapter.Req,
+
+      # Retry
+      max_retries: 3,
+      retry_safe: false,
+      base_delay: 1000,
+      max_delay: 30000,
+      jitter_factor: 0.2,
+
+      # Rate limiting
+      rate_limit: [
+        enabled: false,
+        requests: 100,
+        per: :minute,
+        strategy: :wait,
+        max_wait_time: 5000
+      ],
+
+      # Circuit breaker
+      circuit_breaker: [
+        enabled: false,
+        failure_threshold: 5,
+        failure_threshold_percentage: nil,
+        window_size: 10,
+        timeout: 60_000,
+        half_open_requests: 1
+      ],
+
+      # Logging
+      logging: [
+        enabled: true,
+        level: :info,
+        sanitize_headers: [],
+        sanitize_body_fields: []
+      ],
+
+      # Test mode
+      test_mode: false
+    ```
+  </Tab>
+  <Tab title="Per-Client (HTTPower.new/1)">
+    Per-client configuration creates a reusable client struct with defaults applied to every request made through that client. Use this when you talk to one API from multiple places in your codebase.
+
+    ```elixir
+    client = HTTPower.new(
+      base_url: "https://api.example.com",
+      headers: %{"authorization" => "Bearer #{token}"},
+      timeout: 30,
+      max_retries: 5,
+      circuit_breaker: [failure_threshold: 3],
+      rate_limit: [requests: 100, per: :minute]
+    )
+
+    # All requests through this client inherit the options above
+    HTTPower.get(client, "/users")
+    HTTPower.post(client, "/users", body: data)
+    ```
+
+    The `base_url` option is only available at the per-client level. Per-request calls pass a path that is appended to it.
+  </Tab>
+  <Tab title="Per-Request (inline options)">
+    Per-request options are passed directly to the HTTP method call. They override anything set at the per-client or global level for that single request.
+
+    ```elixir
+    # Override timeout for a slow endpoint
+    HTTPower.get(client, "/slow", timeout: 60)
+
+    # Override retry behaviour for an idempotent operation
+    HTTPower.get(url, max_retries: 5, retry_safe: true)
+
+    # Use a different adapter for one request
+    HTTPower.get(url, adapter: HTTPower.Adapter.Tesla)
+
+    # Override circuit breaker with a named key
+    HTTPower.get(url,
+      circuit_breaker: [failure_threshold: 3, timeout: 30_000],
+      circuit_breaker_key: "payment_api"
+    )
+    ```
+  </Tab>
+</Tabs>
+
+## Configuration availability matrix
+
+Not every option is available at every level. This table shows where each option can be set.
+
+### Adapter
+
+| Option | Global | Per-Client | Per-Request | Notes |
+|--------|--------|------------|-------------|-------|
+| `adapter` | ✅ | ✅ | ✅ | Global: `config :httpower, adapter:` |
+
+### Testing
+
+| Option | Global | Per-Client | Per-Request | Notes |
+|--------|--------|------------|-------------|-------|
+| `test_mode` | ✅ | ❌ | ❌ | Global only |
+
+### Retry
+
+| Option | Global | Per-Client | Per-Request | Notes |
+|--------|--------|------------|-------------|-------|
+| `max_retries` | ✅ | ✅ | ✅ | |
+| `retry_safe` | ✅ | ✅ | ✅ | |
+| `base_delay` | ✅ | ✅ | ✅ | |
+| `max_delay` | ✅ | ✅ | ✅ | |
+| `jitter_factor` | ✅ | ✅ | ✅ | |
+
+### Rate limiting
+
+| Option | Global | Per-Client | Per-Request | Notes |
+|--------|--------|------------|-------------|-------|
+| `rate_limit` | ✅ | ✅ | ✅ | Global: nested keyword list |
+| `rate_limit_key` | ❌ | ✅ | ✅ | Per-client/request only |
+
+### Circuit breaker
+
+| Option | Global | Per-Client | Per-Request | Notes |
+|--------|--------|------------|-------------|-------|
+| `circuit_breaker` | ✅ | ✅ | ✅ | Global: nested keyword list |
+| `circuit_breaker_key` | ❌ | ✅ | ✅ | Per-client/request only |
+
+### Logging
+
+| Option | Global | Per-Client | Per-Request | Notes |
+|--------|--------|------------|-------------|-------|
+| `logging` | ✅ | ✅ | ✅ | Global: nested keyword list |
+
+### Request options
+
+| Option | Global | Per-Client | Per-Request | Notes |
+|--------|--------|------------|-------------|-------|
+| `base_url` | ❌ | ✅ | ❌ | Per-client only |
+| `headers` | ❌ | ✅ | ✅ | Merged across levels |
+| `body` | ❌ | ❌ | ✅ | Per-request only (POST/PUT) |
+| `timeout` | ❌ | ✅ | ✅ | Per-client/request only |
+| `ssl_verify` | ❌ | ✅ | ✅ | Per-client/request only |
+| `proxy` | ❌ | ✅ | ✅ | Per-client/request only |
+
+## Header merging
+
+Unlike other options where the most specific value wins outright, headers from all three levels are **merged together**. Per-request headers overwrite per-client headers for any key that appears in both, but headers unique to each level are all included in the final request.
+
+```elixir
+# Per-client config
+client = HTTPower.new(
+  headers: %{"authorization" => "Bearer token"}
+)
+
+# Per-request call
+HTTPower.get(client, "/api",
+  headers: %{"x-request-id" => "abc-123"}
+)
+
+# Final headers sent with the request:
+# %{
+#   "authorization" => "Bearer token",
+#   "x-request-id"  => "abc-123"
+# }
+```
+
+If the same header key appears at multiple levels, the more specific level wins:
+
+```elixir
+client = HTTPower.new(
+  headers: %{"x-version" => "1"}
+)
+
+# Per-request header overrides the client-level value
+HTTPower.get(client, "/api",
+  headers: %{"x-version" => "2"}
+)
+# Sends: %{"x-version" => "2"}
+```
+
+## Per-request overrides
+
+Any option set at the per-client level can be overridden for a single request:
+
+```elixir
+client = HTTPower.new(
+  base_url: "https://api.example.com",
+  timeout: 30,
+  max_retries: 3
+)
+
+# Uses client defaults
+HTTPower.get(client, "/users")
+
+# Overrides timeout for this slow endpoint only
+HTTPower.get(client, "/reports/generate", timeout: 120)
+
+# Overrides retry settings for a non-idempotent call
+HTTPower.post(client, "/payments", body: payload, max_retries: 0)
+
+# Uses a per-request rate limit bucket
+HTTPower.get(client, "/search",
+  rate_limit: [requests: 10, per: :second],
+  rate_limit_key: "search_endpoint"
+)
+```
+
+## Environment-specific configuration
+
+<Tabs>
+  <Tab title="config/dev.exs">
+    In development, disable circuit breakers and rate limits so they don't interfere with debugging, and use verbose logging.
+
+    ```elixir
+    # config/dev.exs
+    config :httpower,
+      logging: [enabled: true, level: :debug],
+      circuit_breaker: [enabled: false],
+      rate_limit: [enabled: false]
+    ```
+  </Tab>
+  <Tab title="config/test.exs">
+    In test, enable test mode and silence all middleware that would interfere with deterministic tests.
+
+    ```elixir
+    # config/test.exs
+    config :httpower,
+      test_mode: true,
+      logging: [enabled: false],
+      circuit_breaker: [enabled: false],
+      rate_limit: [enabled: false]
+    ```
+  </Tab>
+  <Tab title="config/prod.exs">
+    In production, enable all reliability features with appropriate thresholds.
+
+    ```elixir
+    # config/prod.exs
+    config :httpower,
+      max_retries: 3,
+      circuit_breaker: [
+        enabled: true,
+        failure_threshold: 5,
+        timeout: 60_000
+      ],
+      rate_limit: [
+        enabled: true,
+        requests: 100,
+        per: :minute,
+        strategy: :wait
+      ],
+      logging: [
+        enabled: true,
+        level: :info,
+        sanitize_headers: ["authorization", "api-key"],
+        sanitize_body_fields: ["password", "credit_card", "cvv"]
+      ]
+    ```
+  </Tab>
+</Tabs>
+
+<Tip>
+For production-ready defaults that encode best practices for specific use cases, use [configuration profiles](/configuration/profiles). Profiles like `:payment_processing`, `:high_volume_api`, and `:microservices_mesh` give you well-tuned values without manual configuration.
+</Tip>

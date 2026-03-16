@@ -1,0 +1,69 @@
+---
+title: "Introduction"
+description: "HTTPower is a production-ready Elixir HTTP client library with circuit breakers, rate limiting, PCI-compliant logging, and smart retries — built on top of Finch, Req, or Tesla."
+---
+
+[![Hex.pm](https://img.shields.io/hexpm/v/httpower)](https://hex.pm/packages/httpower)
+
+HTTPower is a production-ready HTTP client library for Elixir. Rather than replacing your existing HTTP client, it wraps it through an adapter system — adding reliability patterns, observability, and compliance features that work consistently across [Finch](/adapters), [Req](/adapters), and [Tesla](/adapters).
+
+HTTPower never raises exceptions for HTTP operations. Every request returns `{:ok, %HTTPower.Response{}}` or `{:error, %HTTPower.Error{}}`, keeping your application stable even when external services fail.
+
+## Key features
+
+<Columns cols={2}>
+  <Card title="Circuit breaker" icon="shield">
+    Automatic failure detection and recovery with closed, open, and half-open state tracking. Prevents cascading failures when a downstream service goes down.
+  </Card>
+  <Card title="Built-in rate limiting" icon="gauge">
+    Token bucket algorithm with per-endpoint configuration. Supports `:wait` and `:error` strategies, custom bucket keys, and automatic parsing of rate-limit response headers.
+  </Card>
+  <Card title="Smart retry logic" icon="rotate-cw">
+    Exponential backoff with jitter, configurable retry policies, and `Retry-After` header support. HTTPower's retry layer works identically across all adapters.
+  </Card>
+  <Card title="PCI-compliant logging" icon="lock">
+    Opt-in telemetry-based logging with automatic sanitization of sensitive fields — `Authorization`, credit card numbers, CVV codes, and more.
+  </Card>
+  <Card title="Request deduplication" icon="copy">
+    In-flight request deduplication using a hash of method + URL + body. Prevents duplicate side effects from double-clicks or concurrent identical requests.
+  </Card>
+  <Card title="Comprehensive telemetry" icon="bar-chart">
+    Emits `:telemetry` events for requests, retries, rate limiting, circuit breaker state changes, and deduplication. Integrates with Prometheus, OpenTelemetry, and Phoenix LiveDashboard.
+  </Card>
+  <Card title="Correlation IDs" icon="link">
+    Every request gets a unique `req_` + 16-hex-character correlation ID for distributed tracing, request tracking, and log correlation.
+  </Card>
+  <Card title="Test mode blocking" icon="flask-conical">
+    Prevents real HTTP requests during testing while allowing mocked requests via `HTTPower.Test`. Adapter-agnostic test helpers work regardless of which adapter you use.
+  </Card>
+</Columns>
+
+## Adapter system
+
+HTTPower routes actual HTTP calls through one of three built-in adapters. You choose the adapter; HTTPower's production features — circuit breaker, rate limiting, PCI logging, smart retries — work consistently across all of them.
+
+| Adapter | Library | Best for |
+|---|---|---|
+| `HTTPower.Adapter.Finch` | [Finch](https://hex.pm/packages/finch) | High-throughput production workloads with explicit connection pool control |
+| `HTTPower.Adapter.Req` | [Req](https://hex.pm/packages/req) | Convenience-first workflows with automatic JSON handling |
+| `HTTPower.Adapter.Tesla` | [Tesla](https://hex.pm/packages/tesla) | Existing Tesla applications that want to add reliability patterns without rewriting |
+
+If multiple adapters are installed, HTTPower auto-detects in priority order: Finch → Req → Tesla. You can override this globally in config or per-request.
+
+## Who HTTPower is built for
+
+- **API integrations** — rate limiting and circuit breakers for third-party APIs
+- **Payment processing** — PCI-compliant logging and audit trails
+- **Microservices** — reliability patterns across service boundaries
+- **Financial services** — compliance and observability requirements
+
+## Next steps
+
+<Columns cols={2}>
+  <Card title="Quick start" icon="rocket" href="/quickstart">
+    Install HTTPower, make your first request, and set up a configured client in minutes.
+  </Card>
+  <Card title="Adapter support" icon="plug" href="/adapters">
+    Understand the adapter system and learn how to configure Finch, Req, and Tesla.
+  </Card>
+</Columns>

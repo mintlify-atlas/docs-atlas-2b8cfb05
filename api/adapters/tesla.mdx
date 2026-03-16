@@ -1,0 +1,136 @@
+---
+title: "HTTPower.Adapter.Tesla"
+description: "Tesla adapter for wrapping an existing Tesla client with HTTPower's production features."
+---
+
+`HTTPower.Adapter.Tesla` bridges HTTPower to an existing [Tesla](https://github.com/elixir-tesla/tesla) client. Rather than replacing your Tesla configuration, this adapter wraps it: Tesla continues to handle the HTTP transport and its own middleware stack, while HTTPower adds circuit breaking, rate limiting, deduplication, retry, and PCI-compliant logging on top.
+
+## Installation
+
+```elixir
+# mix.exs
+defp deps do
+  [
+    {:httpower, "~> 0.1"},
+    {:tesla, ">= 1.10.0"}
+  ]
+end
+```
+
+<Note>
+The adapter module is compiled conditionally via `Code.ensure_loaded?(Tesla)`. Unlike the Finch and Req adapters, the Tesla adapter **requires** a pre-built Tesla client to be passed at call time. It cannot be selected as a default adapter without a client.
+</Note>
+
+---
+
+## Passing a Tesla Client
+
+The Tesla client is passed as the second element of a two-tuple in the `:adapter` option:
+
+```elixir
+tesla_client = Tesla.client([
+  {Tesla.Middleware.BaseUrl, "https://api.example.com"},
+  Tesla.Middleware.JSON,
+  Tesla.Middleware.Logger
+])
+
+client = HTTPower.new(
+  adapter: {HTTPower.Adapter.Tesla, tesla_client}
+)
+
+HTTPower.get(client, "/users")
+```
+
+The Tesla client is extracted from `opts[:adapter_config]` inside the adapter. Calling the Tesla adapter without a client raises `ArgumentError`.
+
+---
+
+## Middleware Compatibility
+
+All middleware in your Tesla client's stack continues to execute normally. HTTPower's features run at a higher level and do not interfere with Tesla middleware:
+
+```
+HTTPower pipeline (retry, circuit breaker, rate limiter, dedup)
+  └─> TestInterceptor.intercept/4
+        └─> :continue → Tesla.request/2
+              └─> Tesla middleware stack (auth, JSON, logging, ...)
+                    └─> Tesla adapter (Finch, Hackney, Mint, Gun, ...)
+```
+
+<Warning>
+If your Tesla client includes a retry middleware (e.g., `Tesla.Middleware.Retry`), it will conflict with HTTPower's retry logic. Disable the Tesla retry middleware when using HTTPower to avoid doubled retry behavior.
+</Warning>
+
+---
+
+## Response Format
+
+Tesla `%Tesla.Env{}` responses are converted to `%HTTPower.Response{}`:
+
+- `env.status` → `response.status`
+- `env.headers` → `response.headers` (list of tuples converted to `%{"key" => ["value"]}` format, matching the Finch adapter format)
+- `env.body` → `response.body` (passed through as-is; Tesla middleware handles encoding/decoding)
+
+---
+
+## Testing
+
+You can use Tesla's own testing utilities with this adapter:
+
+```elixir
+# Using Tesla.Mock
+Tesla.Mock.mock(fn
+  %{method: :get, url: "https://api.example.com/users"} ->
+    %Tesla.Env{status: 200, body: %{"users" => []}}
+end)
+```
+
+Or use HTTPower's adapter-agnostic test mode:
+
+```elixir
+Application.put_env(:httpower, :test_mode, true)
+# Requests will be blocked by TestInterceptor unless HTTPower.Test.stub/1 is registered
+```
+
+See [`HTTPower.Test`](/api/test) for full documentation.
+
+---
+
+## Full Example
+
+```elixir
+# Define your Tesla module with its own middleware stack
+defmodule MyApp.PaymentClient do
+  use Tesla
+
+  plug Tesla.Middleware.BaseUrl, "https://api.stripe.com"
+  plug Tesla.Middleware.JSON
+  plug Tesla.Middleware.Headers, [{"authorization", "Bearer #{System.get_env("STRIPE_KEY")}"}]
+
+  # Use Finch as the Tesla transport
+  adapter Tesla.Adapter.Finch, name: MyApp.Finch
+end
+
+# Wrap the Tesla client with HTTPower for production reliability
+tesla_client = MyApp.PaymentClient.client()
+
+client = HTTPower.new(
+  adapter: {HTTPower.Adapter.Tesla, tesla_client},
+  # HTTPower adds these on top of Tesla's stack:
+  circuit_breaker: [
+    enabled: true,
+    failure_threshold: 5,
+    timeout: 30_000
+  ],
+  rate_limit: [
+    enabled: true,
+    requests: 100,
+    per: :minute
+  ]
+)
+
+# Tesla handles HTTP + auth + JSON; HTTPower adds reliability
+{:ok, response} = HTTPower.post(client, "/v1/charges",
+  body: %{amount: 2000, currency: "usd", source: "tok_visa"}
+)
+```

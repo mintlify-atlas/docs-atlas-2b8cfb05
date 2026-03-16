@@ -1,0 +1,384 @@
+---
+title: "HTTPower"
+description: "Top-level module and primary public API for HTTPower."
+---
+
+The `HTTPower` module is the main entry point for the library. It provides a concise, uniform interface for all HTTP methods while layering production reliability features — retries, circuit breaking, rate limiting, deduplication, PCI-compliant logging, and telemetry — on top of your chosen HTTP client adapter.
+
+<Note>
+  HTTPower **never raises exceptions** for HTTP operations. Every function in this module returns either `{:ok, %HTTPower.Response{}}` or `{:error, %HTTPower.Error{}}`. Configuration errors (such as passing an unknown profile to `new/1`) raise `ArgumentError` at construction time, following standard Elixir conventions.
+</Note>
+
+<Warning>
+  `{:ok, response}` means the server sent a response — **not** that the request succeeded in a business logic sense. 4xx and 5xx responses are returned as `{:ok, response}`. After retries are exhausted for retryable status codes (500, 502, 503, 504), the final server response is still `{:ok, response}`. Always inspect `response.status`.
+
+  ```elixir
+  case HTTPower.get("https://api.example.com/users") do
+    {:ok, %{status: status}} when status in 200..299 ->
+      # Success
+    {:ok, %{status: status} = response} ->
+      # Server responded with non-2xx (including 5xx after retries exhausted)
+    {:error, %HTTPower.Error{reason: reason}} ->
+      # Transport error (timeout, connection refused, etc.)
+  end
+  ```
+</Warning>
+
+## Struct
+
+```elixir
+@type client :: %HTTPower{
+  base_url: String.t() | nil,
+  options: keyword()
+}
+
+defstruct base_url: nil, options: []
+```
+
+A pre-configured client instance. Created with `new/1` and passed as the first argument to any HTTP method.
+
+---
+
+## new/1
+
+```elixir
+@spec new(keyword()) :: HTTPower.client()
+```
+
+Creates a new, pre-configured client struct. Use this to share base URL, headers, timeouts, and other settings across multiple requests without repeating them.
+
+Raises `ArgumentError` if an unknown `:profile` is given.
+
+<ParamField path="opts" type="keyword()">
+  Configuration options for the client.
+
+  <Expandable title="Options">
+    <ParamField path="base_url" type="String.t()">
+      Base URL prepended to all relative paths passed to HTTP methods.
+    </ParamField>
+    <ParamField path="profile" type=":payment_processing | :high_volume_api | :microservices_mesh">
+      A pre-built configuration profile. Profile defaults are merged with explicit options; explicit options take precedence.
+    </ParamField>
+    <ParamField path="timeout" type="integer()">
+      Request timeout in seconds. Default: `60`.
+    </ParamField>
+    <ParamField path="max_retries" type="integer()">
+      Maximum number of retries after the initial attempt. Default: `3`.
+    </ParamField>
+    <ParamField path="retry_safe" type="boolean()">
+      Enable retries for connection resets (`:econnreset`). Default: `false`.
+    </ParamField>
+    <ParamField path="ssl_verify" type="boolean()">
+      Enable SSL certificate verification. Default: `true`.
+    </ParamField>
+    <ParamField path="proxy" type=":system | term()">
+      Proxy configuration. Default: `:system`.
+    </ParamField>
+    <ParamField path="headers" type="map()">
+      Headers applied to every request made with this client. Per-request headers are merged on top.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+```elixir
+# Minimal client with a base URL
+client = HTTPower.new(base_url: "https://api.example.com")
+
+# Client with authentication and custom timeouts
+client = HTTPower.new(
+  base_url: "https://api.example.com",
+  headers: %{"Authorization" => "Bearer token"},
+  timeout: 30,
+  max_retries: 5,
+  retry_safe: true
+)
+
+# Use a pre-built profile
+client = HTTPower.new(
+  base_url: "https://payment-gateway.com",
+  profile: :payment_processing
+)
+
+# Profile with an overridden option
+client = HTTPower.new(
+  base_url: "https://api.example.com",
+  profile: :high_volume_api,
+  rate_limit: [requests: 2000]
+)
+```
+
+---
+
+## get/2,3
+
+```elixir
+@spec get(String.t(), keyword()) :: {:ok, HTTPower.Response.t()} | {:error, HTTPower.Error.t()}
+@spec get(HTTPower.client(), String.t()) :: {:ok, HTTPower.Response.t()} | {:error, HTTPower.Error.t()}
+@spec get(HTTPower.client(), String.t(), keyword()) :: {:ok, HTTPower.Response.t()} | {:error, HTTPower.Error.t()}
+```
+
+Makes an HTTP GET request. Accepts either a full URL string or a pre-configured client plus a path.
+
+<ParamField path="url_or_client" type="String.t() | HTTPower.client()" required>
+  A full URL string (`"https://api.example.com/users"`) or a client struct created with `new/1`.
+</ParamField>
+
+<ParamField path="opts_or_path" type="keyword() | String.t()">
+  When the first argument is a URL string: a keyword list of request options.
+  When the first argument is a client: a path string to append to the client's `base_url`.
+</ParamField>
+
+<ParamField path="opts" type="keyword()">
+  Request options (3-arity client form only). Merged with client-level options; per-request values win.
+</ParamField>
+
+```elixir
+# Simple GET
+HTTPower.get("https://api.example.com/users")
+
+# GET with headers
+HTTPower.get("https://api.example.com/users",
+  headers: %{"Authorization" => "Bearer token"}
+)
+
+# GET with a configured client
+client = HTTPower.new(base_url: "https://api.example.com")
+HTTPower.get(client, "/users")
+HTTPower.get(client, "/users", timeout: 10)
+```
+
+---
+
+## post/2,3
+
+```elixir
+@spec post(String.t(), keyword()) :: {:ok, HTTPower.Response.t()} | {:error, HTTPower.Error.t()}
+@spec post(HTTPower.client(), String.t()) :: {:ok, HTTPower.Response.t()} | {:error, HTTPower.Error.t()}
+@spec post(HTTPower.client(), String.t(), keyword()) :: {:ok, HTTPower.Response.t()} | {:error, HTTPower.Error.t()}
+```
+
+Makes an HTTP POST request.
+
+<ParamField path="url_or_client" type="String.t() | HTTPower.client()" required>
+  A full URL string or a client struct.
+</ParamField>
+
+<ParamField path="opts_or_path" type="keyword() | String.t()">
+  Options keyword list (URL form) or path string (client form).
+</ParamField>
+
+<ParamField path="opts" type="keyword()">
+  Request options. Supports all standard options plus:
+  - `body` — the request body (string, encoded JSON, form data, etc.)
+</ParamField>
+
+```elixir
+# POST with URL-encoded body
+HTTPower.post("https://api.example.com/users",
+  body: "name=John&email=john@example.com",
+  headers: %{"Content-Type" => "application/x-www-form-urlencoded"}
+)
+
+# POST JSON
+HTTPower.post("https://api.example.com/users",
+  body: Jason.encode!(%{name: "John"}),
+  headers: %{"Content-Type" => "application/json"}
+)
+
+# POST with a configured client
+client = HTTPower.new(base_url: "https://api.example.com")
+HTTPower.post(client, "/users", body: %{name: "John"})
+```
+
+---
+
+## put/2,3
+
+```elixir
+@spec put(String.t(), keyword()) :: {:ok, HTTPower.Response.t()} | {:error, HTTPower.Error.t()}
+@spec put(HTTPower.client(), String.t()) :: {:ok, HTTPower.Response.t()} | {:error, HTTPower.Error.t()}
+@spec put(HTTPower.client(), String.t(), keyword()) :: {:ok, HTTPower.Response.t()} | {:error, HTTPower.Error.t()}
+```
+
+Makes an HTTP PUT request.
+
+<ParamField path="url_or_client" type="String.t() | HTTPower.client()" required>
+  A full URL string or a client struct.
+</ParamField>
+
+<ParamField path="opts_or_path" type="keyword() | String.t()">
+  Options keyword list (URL form) or path string (client form).
+</ParamField>
+
+<ParamField path="opts" type="keyword()">
+  Request options. Supports `body` and all standard options.
+</ParamField>
+
+```elixir
+# PUT with URL string
+HTTPower.put("https://api.example.com/users/1",
+  body: Jason.encode!(%{name: "Jane"}),
+  headers: %{"Content-Type" => "application/json"}
+)
+
+# PUT with a configured client
+client = HTTPower.new(base_url: "https://api.example.com")
+HTTPower.put(client, "/users/1", body: %{name: "Jane"})
+```
+
+---
+
+## delete/2,3
+
+```elixir
+@spec delete(String.t(), keyword()) :: {:ok, HTTPower.Response.t()} | {:error, HTTPower.Error.t()}
+@spec delete(HTTPower.client(), String.t()) :: {:ok, HTTPower.Response.t()} | {:error, HTTPower.Error.t()}
+@spec delete(HTTPower.client(), String.t(), keyword()) :: {:ok, HTTPower.Response.t()} | {:error, HTTPower.Error.t()}
+```
+
+Makes an HTTP DELETE request.
+
+<ParamField path="url_or_client" type="String.t() | HTTPower.client()" required>
+  A full URL string or a client struct.
+</ParamField>
+
+<ParamField path="opts_or_path" type="keyword() | String.t()">
+  Options keyword list (URL form) or path string (client form).
+</ParamField>
+
+<ParamField path="opts" type="keyword()">
+  Request options (3-arity client form only).
+</ParamField>
+
+```elixir
+# DELETE with URL string
+HTTPower.delete("https://api.example.com/users/1")
+
+# DELETE with a configured client
+client = HTTPower.new(base_url: "https://api.example.com")
+HTTPower.delete(client, "/users/1")
+```
+
+---
+
+## patch/2,3
+
+```elixir
+@spec patch(String.t(), keyword()) :: {:ok, HTTPower.Response.t()} | {:error, HTTPower.Error.t()}
+@spec patch(HTTPower.client(), String.t()) :: {:ok, HTTPower.Response.t()} | {:error, HTTPower.Error.t()}
+@spec patch(HTTPower.client(), String.t(), keyword()) :: {:ok, HTTPower.Response.t()} | {:error, HTTPower.Error.t()}
+```
+
+Makes an HTTP PATCH request.
+
+<ParamField path="url_or_client" type="String.t() | HTTPower.client()" required>
+  A full URL string or a client struct.
+</ParamField>
+
+<ParamField path="opts_or_path" type="keyword() | String.t()">
+  Options keyword list (URL form) or path string (client form).
+</ParamField>
+
+<ParamField path="opts" type="keyword()">
+  Request options. Supports `body` and all standard options.
+</ParamField>
+
+```elixir
+HTTPower.patch("https://api.example.com/users/1",
+  body: Jason.encode!(%{name: "Jane"}),
+  headers: %{"Content-Type" => "application/json"}
+)
+
+client = HTTPower.new(base_url: "https://api.example.com")
+HTTPower.patch(client, "/users/1", body: %{name: "Jane"})
+```
+
+---
+
+## head/2,3
+
+```elixir
+@spec head(String.t(), keyword()) :: {:ok, HTTPower.Response.t()} | {:error, HTTPower.Error.t()}
+@spec head(HTTPower.client(), String.t()) :: {:ok, HTTPower.Response.t()} | {:error, HTTPower.Error.t()}
+@spec head(HTTPower.client(), String.t(), keyword()) :: {:ok, HTTPower.Response.t()} | {:error, HTTPower.Error.t()}
+```
+
+Makes an HTTP HEAD request. The response will have no body; use the status and headers.
+
+<ParamField path="url_or_client" type="String.t() | HTTPower.client()" required>
+  A full URL string or a client struct.
+</ParamField>
+
+<ParamField path="opts_or_path" type="keyword() | String.t()">
+  Options keyword list (URL form) or path string (client form).
+</ParamField>
+
+<ParamField path="opts" type="keyword()">
+  Request options (3-arity client form only).
+</ParamField>
+
+```elixir
+HTTPower.head("https://api.example.com/users")
+
+client = HTTPower.new(base_url: "https://api.example.com")
+HTTPower.head(client, "/users")
+```
+
+---
+
+## options/2,3
+
+```elixir
+@spec options(String.t(), keyword()) :: {:ok, HTTPower.Response.t()} | {:error, HTTPower.Error.t()}
+@spec options(HTTPower.client(), String.t()) :: {:ok, HTTPower.Response.t()} | {:error, HTTPower.Error.t()}
+@spec options(HTTPower.client(), String.t(), keyword()) :: {:ok, HTTPower.Response.t()} | {:error, HTTPower.Error.t()}
+```
+
+Makes an HTTP OPTIONS request. Useful for CORS preflight checks and capability discovery.
+
+<ParamField path="url_or_client" type="String.t() | HTTPower.client()" required>
+  A full URL string or a client struct.
+</ParamField>
+
+<ParamField path="opts_or_path" type="keyword() | String.t()">
+  Options keyword list (URL form) or path string (client form).
+</ParamField>
+
+<ParamField path="opts" type="keyword()">
+  Request options (3-arity client form only).
+</ParamField>
+
+```elixir
+HTTPower.options("https://api.example.com/users")
+
+client = HTTPower.new(base_url: "https://api.example.com")
+HTTPower.options(client, "/users")
+```
+
+---
+
+## test\_mode?/0
+
+```elixir
+@spec test_mode?() :: boolean()
+```
+
+Returns `true` if HTTPower is currently running in test mode. In test mode, real outbound HTTP requests are blocked and return `{:error, %HTTPower.Error{reason: :network_blocked}}` unless the request includes a `:plug` option (for `Req.Test` mocking) or an explicit `:adapter` tuple.
+
+```elixir
+# In test configuration
+Application.put_env(:httpower, :test_mode, true)
+
+HTTPower.test_mode?()  # => true
+
+# Blocked — no plug or adapter provided
+HTTPower.get("https://real-api.com")
+# => {:error, %HTTPower.Error{reason: :network_blocked, message: "Network access blocked in test mode"}}
+
+# Allowed — plug bypasses test mode blocking
+HTTPower.get("https://api.com", plug: {Req.Test, MyApp})
+```
+
+<Tip>
+  Set `config :httpower, test_mode: true` in `config/test.exs` to automatically block real HTTP calls in your test suite. Individual tests can opt in to real-or-mocked requests via the `:plug` option.
+</Tip>

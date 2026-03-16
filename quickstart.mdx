@@ -1,80 +1,209 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: "Quick Start"
+description: "Get HTTPower installed and making your first HTTP request in minutes."
 ---
 
-## Get started in three steps
+<Steps>
+  <Step title="Install HTTPower">
+    Add `httpower` and at least one HTTP client adapter to your `mix.exs` dependencies:
 
-Get your documentation site running locally and make your first customization.
+    <Tabs>
+      <Tab title="Finch (recommended)">
+        ```elixir mix.exs
+        def deps do
+          [
+            {:httpower, "~> 0.20.0"},
+            {:finch, ">= 0.19.0"}
+          ]
+        end
+        ```
 
-### Step 1: Set up your local environment
+        Finch is the default and recommended adapter. It provides high-performance HTTP built on Mint with explicit connection pooling.
+      </Tab>
+      <Tab title="Req">
+        ```elixir mix.exs
+        def deps do
+          [
+            {:httpower, "~> 0.20.0"},
+            {:req, ">= 0.4.0"}
+          ]
+        end
+        ```
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+        Req is a batteries-included HTTP client with automatic JSON handling.
+      </Tab>
+      <Tab title="Tesla">
+        ```elixir mix.exs
+        def deps do
+          [
+            {:httpower, "~> 0.20.0"},
+            {:tesla, ">= 1.10.0"}
+          ]
+        end
+        ```
 
-### Step 2: Deploy your changes
+        Use Tesla if you already have a Tesla setup with custom middleware you want to preserve.
+      </Tab>
+      <Tab title="All adapters">
+        ```elixir mix.exs
+        def deps do
+          [
+            {:httpower, "~> 0.20.0"},
+            {:finch, ">= 0.19.0"},   # Recommended - high performance
+            {:req, ">= 0.4.0"},       # Batteries-included with auto-JSON
+            {:tesla, ">= 1.10.0"}     # If you already use Tesla
+          ]
+        end
+        ```
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+        When multiple adapters are present, HTTPower automatically selects Finch by default (Finch → Req → Tesla priority).
+      </Tab>
+    </Tabs>
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    <Note>
+      At least one adapter is required. If multiple are installed, Finch takes priority. You can override the adapter globally in config or per-client/request.
+    </Note>
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    Then fetch dependencies:
 
-### Step 3: Go live
+    ```bash
+    mix deps.get
+    ```
+  </Step>
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+  <Step title="Make your first request">
+    HTTPower works immediately with no configuration — just call the functions:
 
-## Next steps
+    ```elixir
+    # Simple GET request
+    {:ok, response} = HTTPower.get("https://api.example.com/users")
+    IO.inspect(response.status)  # 200
+    IO.inspect(response.body)    # %{"users" => [...]}
 
-Now that you have your docs running, explore these key features:
+    # POST with JSON body
+    {:ok, response} = HTTPower.post("https://api.example.com/users",
+      body: Jason.encode!(%{name: "John", email: "john@example.com"}),
+      headers: %{"Content-Type" => "application/json"}
+    )
+
+    # POST with form data
+    {:ok, response} = HTTPower.post("https://api.example.com/users",
+      body: "name=John&email=john@example.com",
+      headers: %{"Content-Type" => "application/x-www-form-urlencoded"}
+    )
+    ```
+
+    <Note>
+      `{:ok, response}` means the server responded — not that the business logic succeeded. This includes 4xx and 5xx responses. Always check `response.status` to determine the outcome.
+    </Note>
+  </Step>
+
+  <Step title="Create a configured client">
+    For multiple requests to the same API, create a reusable client with `HTTPower.new/1`:
+
+    ```elixir
+    # Create a client with base URL and shared settings
+    client = HTTPower.new(
+      base_url: "https://api.example.com",
+      headers: %{"authorization" => "Bearer #{token}"},
+      timeout: 30,
+      max_retries: 3
+    )
+
+    # Reuse the client for multiple requests
+    {:ok, users}   = HTTPower.get(client, "/users")
+    {:ok, user}    = HTTPower.get(client, "/users/123")
+    {:ok, created} = HTTPower.post(client, "/users", body: data)
+    {:ok, deleted} = HTTPower.delete(client, "/users/456")
+    ```
+
+    For common use cases, use a pre-built profile instead of configuring everything manually:
+
+    ```elixir
+    # Payment processing: conservative rate limits, dedup to prevent double charges
+    payment_client = HTTPower.new(
+      base_url: "https://api.stripe.com",
+      profile: :payment_processing
+    )
+
+    # High-volume API: adaptive rate limiting, fast circuit recovery
+    api_client = HTTPower.new(
+      base_url: "https://api.github.com",
+      profile: :high_volume_api
+    )
+
+    # Microservices: prevent cascade failures and retry storms
+    service_client = HTTPower.new(
+      base_url: "https://internal-service.svc",
+      profile: :microservices_mesh
+    )
+    ```
+
+    <Tip>
+      Profile settings can be overridden with explicit options. For example: `HTTPower.new(profile: :payment_processing, max_retries: 5)` uses the payment profile but with 5 retries instead of the profile default of 3.
+    </Tip>
+  </Step>
+
+  <Step title="Handle errors gracefully">
+    HTTPower never raises exceptions for HTTP operations. Every call returns either `{:ok, response}` or `{:error, error}`:
+
+    ```elixir
+    case HTTPower.get("https://api.example.com/users") do
+      {:ok, %HTTPower.Response{status: status, body: body}} when status in 200..299 ->
+        # Success - process the response body
+        process_data(body)
+
+      {:ok, %HTTPower.Response{status: 404}} ->
+        # Server responded with 404 - handle not found
+        handle_not_found()
+
+      {:ok, %HTTPower.Response{status: status}} when status >= 500 ->
+        # Server error - after retries exhausted, still returns {:ok, response}
+        handle_server_error(status)
+
+      {:error, %HTTPower.Error{reason: :timeout}} ->
+        # Network timeout
+        handle_timeout()
+
+      {:error, %HTTPower.Error{reason: :econnrefused}} ->
+        # Connection refused
+        handle_connection_error()
+
+      {:error, %HTTPower.Error{reason: :service_unavailable}} ->
+        # Circuit breaker is open
+        use_fallback()
+
+      {:error, %HTTPower.Error{reason: :too_many_requests}} ->
+        # Rate limit exceeded with :error strategy
+        handle_rate_limit()
+    end
+    ```
+
+    <Warning>
+      `{:ok, response}` is returned even for 4xx and 5xx status codes — it means the server responded successfully over the network. Only `{:error, error}` indicates a transport-level failure (timeout, connection refused, etc.) or middleware rejection (circuit open, rate limit exceeded with `:error` strategy).
+    </Warning>
+  </Step>
+</Steps>
+
+## What's next?
 
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Adapter support" icon="plug" href="/adapters">
+    Learn about Finch, Req, and Tesla adapter differences and configuration
+  </Card>
+  <Card title="Circuit breaker" icon="circle-xmark" href="/features/circuit-breaker">
+    Protect against cascading failures with automatic failure detection
+  </Card>
+  <Card title="Rate limiting" icon="gauge-high" href="/features/rate-limiting">
+    Token bucket rate limiting with per-endpoint configuration
+  </Card>
+  <Card title="PCI-compliant logging" icon="lock" href="/features/pci-logging">
+    Opt-in logging with automatic sanitization of sensitive data
+  </Card>
+  <Card title="Configuration profiles" icon="sliders" href="/configuration/profiles">
+    Pre-built profiles for payment processing, high-volume APIs, and microservices
+  </Card>
+  <Card title="Test mode" icon="flask" href="/configuration/test-mode">
+    Block real HTTP requests during tests with adapter-agnostic mocking
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

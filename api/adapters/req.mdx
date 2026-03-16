@@ -1,0 +1,134 @@
+---
+title: "HTTPower.Adapter.Req"
+description: "Batteries-included HTTP adapter with automatic JSON handling, built on Req."
+---
+
+`HTTPower.Adapter.Req` delegates HTTP requests to [Req](https://github.com/wojtekmach/req), a "batteries-included" HTTP client with automatic JSON encoding/decoding, response decompression (gzip, brotli, zstd), and native integration with `Req.Test`.
+
+## Installation
+
+```elixir
+# mix.exs
+defp deps do
+  [
+    {:httpower, "~> 0.1"},
+    {:req, ">= 0.4.0"}
+  ]
+end
+```
+
+<Note>
+The adapter module is compiled conditionally via `Code.ensure_loaded?(Req)`. When both Finch and Req are present, Finch is selected as the default adapter. To use Req explicitly, pass `adapter: HTTPower.Adapter.Req`.
+</Note>
+
+---
+
+## How Requests Are Made
+
+```
+HTTPower.get/2
+  └─> TestInterceptor.intercept/4
+        └─> :continue → HTTPower.Adapter.Req.do_request/5
+              └─> Req.request/1
+```
+
+---
+
+## Configuration Options
+
+<ParamField path="timeout" type="integer">
+  Request timeout in **seconds**. Converted to milliseconds as `receive_timeout: timeout * 1000`. Default: `60`.
+</ParamField>
+
+<ParamField path="ssl_verify" type="boolean">
+  Enable SSL peer verification. When `false`, sets `verify: :verify_none` in `connect_options`. Default: `true`.
+</ParamField>
+
+<ParamField path="proxy" type=":system | nil | keyword()">
+  Proxy configuration placed in `connect_options`.
+  - `:system` — use system proxy settings (default)
+  - `nil` — no proxy
+  - keyword list — custom proxy options
+</ParamField>
+
+<ParamField path="plug" type="{module(), term()} | module()">
+  A `Req.Test` plug for intercepting requests in tests. Example: `{Req.Test, MyApp}`. This option is passed through to Req directly and is **not** stripped from the options list.
+</ParamField>
+
+---
+
+## Automatic JSON Handling
+
+Req decodes JSON response bodies automatically before HTTPower receives the response. This means `response.body` will already be a decoded Elixir map or list for JSON APIs — no manual `Jason.decode!/1` required:
+
+```elixir
+{:ok, response} = HTTPower.get("https://api.example.com/users",
+  adapter: HTTPower.Adapter.Req
+)
+
+# body is already decoded
+users = response.body["users"]
+```
+
+Req also handles response decompression transparently; the adapter receives the decompressed body.
+
+---
+
+## Retry Behavior
+
+<Warning>
+The Req adapter explicitly sets `retry: false` when building Req options. This disables Req's built-in retry logic. HTTPower's own retry system (exponential backoff with jitter) is used instead, ensuring consistent retry behavior regardless of which adapter is active.
+</Warning>
+
+---
+
+## Req.Test Integration
+
+You can use `Req.Test` directly when using this adapter by passing the `:plug` option:
+
+```elixir
+# In your test
+Req.Test.stub(MyApp, fn conn ->
+  Req.Test.json(conn, %{users: []})
+end)
+
+{:ok, response} = HTTPower.get("https://api.example.com/users",
+  adapter: HTTPower.Adapter.Req,
+  plug: {Req.Test, MyApp}
+)
+
+assert response.body == %{"users" => []}
+```
+
+Alternatively, use `HTTPower.Test` for adapter-agnostic mocking that works without specifying an adapter. See [`HTTPower.Test`](/api/test).
+
+---
+
+## Response Format
+
+Req responses are converted from `%Req.Response{}` to `%HTTPower.Response{}`. Req returns headers as a list of `{"key", "value"}` tuples which are converted to a plain map (`%{"key" => "value"}`). The body is passed through as-is from Req (already decoded if JSON).
+
+---
+
+## Usage
+
+```elixir
+# Explicit adapter selection
+{:ok, response} = HTTPower.get("https://api.example.com/users",
+  adapter: HTTPower.Adapter.Req
+)
+
+# Per-client
+client = HTTPower.new(
+  base_url: "https://api.example.com",
+  adapter: HTTPower.Adapter.Req,
+  timeout: 30
+)
+
+{:ok, response} = HTTPower.post(client, "/users",
+  body: Jason.encode!(%{name: "Alice"})
+)
+
+# response.body is already decoded
+assert response.body["name"] == "Alice"
+```

@@ -1,0 +1,194 @@
+---
+title: "HTTPower.Middleware.RateLimiter"
+description: "Token bucket rate limiter with adaptive circuit breaker coordination."
+---
+
+`HTTPower.Middleware.RateLimiter` enforces configurable rate limits using a token bucket algorithm. Each named bucket refills tokens at a steady rate; requests consume tokens. When a bucket runs dry, the middleware either waits for tokens to become available or returns an error immediately, depending on configuration.
+
+## Token Bucket Algorithm
+
+1. Each bucket has a maximum capacity equal to `requests` (your configured limit).
+2. Tokens refill continuously at a rate of `requests / window_ms` tokens per millisecond.
+3. Each HTTP request consumes exactly one token.
+4. When no token is available:
+   - `:wait` strategy — sleeps until a token refills (up to `max_wait_time` ms)
+   - `:error` strategy — returns `{:error, :too_many_requests}` immediately
+
+## Configuration
+
+```elixir
+config :httpower, :rate_limit,
+  enabled: true,
+  requests: 100,
+  per: :second,       # :second | :minute | :hour
+  strategy: :wait,    # :wait | :error
+  max_wait_time: 5000,
+  adaptive: true
+```
+
+<AccordionGroup>
+  <Accordion title="Configuration options">
+    <ParamField path="enabled" type="boolean">
+      Enable or disable rate limiting. Default: `false`.
+    </ParamField>
+    <ParamField path="requests" type="pos_integer">
+      Maximum number of requests allowed per time window. Also sets the bucket's maximum capacity. Default: `100`.
+    </ParamField>
+    <ParamField path="per" type=":second | :minute | :hour">
+      Time window over which `requests` are allowed. Determines the token refill rate. Default: `:second`.
+    </ParamField>
+    <ParamField path="strategy" type=":wait | :error">
+      What to do when the bucket is empty. `:wait` blocks until a token is available; `:error` returns `{:error, :too_many_requests}` immediately. Default: `:wait`.
+    </ParamField>
+    <ParamField path="max_wait_time" type="pos_integer">
+      Maximum total time in milliseconds to wait for a token when `strategy: :wait`. If the cumulative wait would exceed this value, returns `{:error, :rate_limit_wait_timeout}`. Default: `5000`.
+    </ParamField>
+    <ParamField path="adaptive" type="boolean">
+      Automatically reduce the rate limit when the circuit breaker reports service degradation. See Adaptive Rate Limiting below. Default: `true`.
+    </ParamField>
+  </Accordion>
+</AccordionGroup>
+
+## Adaptive Rate Limiting
+
+When `adaptive: true`, the rate limiter queries the circuit breaker's state for the same host before each request and adjusts the effective rate:
+
+| Circuit State | Effective Rate | Rationale |
+|--------------|---------------|----------|
+| `:closed` (healthy) | 100% | Full speed |
+| `:half_open` (recovering) | 50% | Avoid overwhelming a recovering service |
+| `:open` (down) | 10% | Minimal health checks only |
+
+Adaptive adjustments emit a `[:httpower, :rate_limit, :adaptive_reduction]` telemetry event only when the state changes, not on every request.
+
+---
+
+## Public Functions
+
+### `update_from_headers/2`
+
+Synchronizes the local token bucket with the server's actual rate limit state as reported in response headers. After this call the bucket's token count reflects the server's `remaining` value.
+
+```elixir
+@spec update_from_headers(bucket_key(), map()) :: :ok
+```
+
+<ParamField path="bucket_key" type="String.t()" required>
+  The key identifying the bucket to update. Typically a hostname.
+</ParamField>
+
+<ParamField path="rate_limit_info" type="map()" required>
+  A map produced by `HTTPower.RateLimitHeaders.parse/1`. Must include at minimum a `:remaining` key with an integer value.
+</ParamField>
+
+```elixir
+# Parse headers from a response, then sync the local bucket
+{:ok, response} = HTTPower.get("https://api.github.com/repos/elixir-lang/elixir")
+
+case HTTPower.RateLimitHeaders.parse(response.headers) do
+  {:ok, rate_limit_info} ->
+    HTTPower.Middleware.RateLimiter.update_from_headers("api.github.com", rate_limit_info)
+  {:error, :not_found} ->
+    :ok
+end
+```
+
+<Note>
+HTTPower automatically calls `update_from_headers/2` after each response when the `RateLimitHeaders` middleware is in the pipeline. You only need to call it manually if you are integrating rate limit header parsing outside the standard pipeline.
+</Note>
+
+---
+
+### `get_info/1`
+
+Returns the current state of a token bucket. Reads directly from ETS.
+
+```elixir
+@spec get_info(bucket_key()) :: map() | nil
+```
+
+<ParamField path="bucket_key" type="String.t()" required>
+  The key identifying the bucket to inspect.
+</ParamField>
+
+**Returns** a map or `nil` if no bucket exists for the key.
+
+<ResponseField name="current_tokens" type="float">
+  Number of tokens currently available in the bucket. Can be fractional due to continuous refill.
+</ResponseField>
+
+<ResponseField name="last_refill_ms" type="integer">
+  Monotonic timestamp (in milliseconds) of the last time the bucket was read or written. Used to calculate how many tokens have accumulated since the last access.
+</ResponseField>
+
+```elixir
+HTTPower.Middleware.RateLimiter.get_info("api.github.com")
+# => %{
+#      current_tokens: 55.0,
+#      last_refill_ms: 1234567890
+#    }
+
+HTTPower.Middleware.RateLimiter.get_info("unknown-host")
+# => nil
+```
+
+---
+
+## Internal State
+
+Each bucket is stored in the ETS table `:httpower_rate_limiter` as a two-element tuple:
+
+```elixir
+@type bucket_state :: {
+        current_tokens :: float(),
+        last_refill_ms :: integer()
+      }
+```
+
+Buckets inactive for more than 5 minutes are removed by a periodic cleanup process that runs every 60 seconds.
+
+---
+
+## Telemetry Events
+
+| Event | Measurements | Metadata |
+|-------|-------------|----------|
+| `[:httpower, :rate_limit, :ok]` | `%{tokens_remaining: float, wait_time_ms: 0}` | `%{bucket_key: key}` |
+| `[:httpower, :rate_limit, :exceeded]` | `%{tokens_remaining: 0}` | `%{bucket_key: key, strategy: :error}` |
+| `[:httpower, :rate_limit, :wait]` | `%{wait_time_ms: integer}` | `%{bucket_key: key, strategy: :wait}` |
+| `[:httpower, :rate_limit, :adaptive_reduction]` | `%{original_rate: n, adjusted_rate: n, reduction_factor: float}` | `%{circuit_key: key, circuit_state: state, coordination: :circuit_breaker_adaptive}` |
+
+---
+
+## Usage Examples
+
+```elixir
+# Per-client rate limiting
+client = HTTPower.new(
+  base_url: "https://api.example.com",
+  rate_limit: [
+    enabled: true,
+    requests: 50,
+    per: :minute,
+    strategy: :wait
+  ]
+)
+
+# Custom bucket key — groups multiple URLs under one limit
+HTTPower.get("https://api.example.com/users",
+  rate_limit_key: "api.example.com",
+  rate_limit: [enabled: true, requests: 100, per: :minute]
+)
+
+# Error strategy — fail fast instead of waiting
+HTTPower.get(url,
+  rate_limit: [
+    enabled: true,
+    requests: 10,
+    per: :second,
+    strategy: :error
+  ]
+)
+# When bucket is empty:
+# => {:error, %HTTPower.Error{reason: :too_many_requests}}
+```
